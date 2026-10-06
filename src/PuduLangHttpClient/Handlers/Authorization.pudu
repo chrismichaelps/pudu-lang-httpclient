@@ -1,0 +1,39 @@
+/** @Handlers.Authorization.Module — credentials added to requests, and refreshed when refused */
+module PuduLangHttpClient.Handlers.Authorization
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+
+/** @Handlers.Authorization.Tokens — a bearer token, fetched again when `refresh` is true */
+export type Tokens = fn(Bool) -> HttpClient.Outcome[Str]
+
+/// The status a server refuses missing or stale credentials with.
+const UNAUTHORIZED: Int = 401
+
+/// A handler authorizing every request without an `authorization` header with a user name and
+/// password, sent in the clear and so only over https.
+export fn basic(user: Str, password: Str) -> Handler.Handler { fixed(Http.basicAuth(user, password)) }
+
+/// A handler authorizing every request without an `authorization` header with a bearer token from
+/// `tokens`; when the server answers `401`, the token is fetched again and the request sent once
+/// more. A failure to fetch a token is the request's failure.
+export fn bearer(tokens: Tokens) -> Handler.Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    if Headers.has(&request.headers, "authorization") { return next(request, token) }
+    let first = next(request.setHeader("authorization", Http.bearerAuth(tokens(false) ?)), token) ?
+    if first.status.code != UNAUTHORIZED { return Ok(first) }
+    next(request.setHeader("authorization", Http.bearerAuth(tokens(true) ?)), token)
+  }
+}
+
+/// A handler adding a fixed `authorization` value to every request without one.
+fn fixed(value: Str) -> Handler.Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    if Headers.has(&request.headers, "authorization") { next(request, token) } else { next(request.setHeader("authorization", value), token) }
+  }
+}

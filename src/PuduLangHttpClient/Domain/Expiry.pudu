@@ -1,0 +1,26 @@
+/** @Domain.Expiry.Module — whether a lifetime or an idle limit has run out */
+module PuduLangHttpClient.Domain.Expiry
+
+import Std.Math as Math
+import PuduLangHttpClient.Constants.Defaults as Defaults
+
+/// Whether something started at `since` has outlived `lifetime` milliseconds at `now`; a lifetime
+/// of `Defaults.INFINITE` never runs out and a lifetime of 0 has already run out.
+export fn elapsed(since: Int, lifetime: Int, now: Int) -> Bool {
+  lifetime != Defaults.INFINITE && now - since >= lifetime
+}
+
+/// Milliseconds left of a deadline at `now`, never below zero, or `None` for no deadline.
+export fn remaining(deadline: Option[Int], now: Int) -> Option[Int] {
+  let at = deadline ?
+  Some(Math.max(at - now, 0))
+}
+
+/// The earlier of two optional deadlines.
+export fn earliest(left: Option[Int], right: Option[Int]) -> Option[Int] {
+  match (left, right) {
+    case (Some(first), Some(second)) => Some(Math.min(first, second))
+    case (Some(first), None) => Some(first)
+    case (None, other) => other
+  }
+}

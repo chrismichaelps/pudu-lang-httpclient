@@ -1,0 +1,118 @@
+/** @Domain.Chunked.Module — a chunked body decoded as its bytes arrive */
+module PuduLangHttpClient.Domain.Chunked
+
+import Std.Bytes as ByteSeq
+
+/** @Domain.Chunked.Phase — what the decoder expects next */
+export type Phase = Size | Data(Int) | DataEnd | Trailer | Done
+
+/** @Domain.Chunked.Decoder — the phase, the bytes not yet decoded, and what was decoded so far */
+export type Decoder = { phase: Phase, pending: Bytes, decoded: Int, trailers: Array[(Str, Str)] }
+
+/** @Domain.Chunked.Problem — why the bytes are not a chunked body within its limit */
+export type Problem = Malformed(Str) | Exceeded
+
+/// The longest chunk-size or trailer line accepted, in bytes.
+const LINE_LIMIT: Int = 8192
+
+/// The bytes that end every line of the framing.
+const CRLF: Str = "\r\n"
+
+/// The decoder before any byte arrived.
+export fn decoder() -> Decoder { Decoder{phase: Size, pending: ByteSeq.empty(), decoded: 0, trailers: []} }
+
+/// Whether the terminating chunk and its trailer section arrived.
+export fn isDone(state: &Decoder) -> Bool { state.phase == Done }
+
+/// The bytes that arrived after the body ended.
+export fn leftover(state: &Decoder) -> Bytes { if state.phase == Done { state.pending } else { ByteSeq.empty() } }
+
+/// The decoder after more bytes arrived, and the body bytes they completed; a body growing past
+/// `limit` decoded bytes is `Exceeded`.
+export fn feed(state: &Decoder, input: &Bytes, limit: Int) -> Result[(Decoder, Bytes), Problem] {
+  var current = Decoder{..*state, pending: state.pending.concat(*input)}
+  var produced: Array[Bytes] = []
+  var going = true
+  while going {
+    match current.phase {
+      case Size => {
+        match line(&current.pending) ? {
+          case None => { going = false }
+          case Some((text, rest)) => {
+            let size = sizeOf(text) ?
+            current = Decoder{..current, pending: rest, phase: if size == 0 { Trailer } else { Data(size) }}
+          }
+        }
+      }
+      case Data(remaining) => {
+        if current.pending.isEmpty() {
+          going = false
+        } else {
+          let taken = current.pending.take(remaining)
+          let decoded = current.decoded + taken.length()
+          if decoded > limit { return Err(Exceeded) }
+          produced = produced.push(taken)
+          let left = remaining - taken.length()
+          current = Decoder{..current, pending: current.pending.drop(taken.length()), decoded: decoded, phase: if left == 0 { DataEnd } else { Data(left) }}
+        }
+      }
+      case DataEnd => {
+        if current.pending.length() < 2 {
+          going = false
+        } else if current.pending.take(2) != CRLF.toBytes() {
+          return Err(Malformed("a chunk is not followed by a line break"))
+        } else {
+          current = Decoder{..current, pending: current.pending.drop(2), phase: Size}
+        }
+      }
+      case Trailer => {
+        match line(&current.pending) ? {
+          case None => { going = false }
+          case Some((text, rest)) => {
+            if text.isEmpty() {
+              current = Decoder{..current, pending: rest, phase: Done}
+            } else {
+              current = Decoder{..current, pending: rest, trailers: current.trailers.push(fieldOf(text) ?)}
+            }
+          }
+        }
+      }
+      case Done => { going = false }
+    }
+  }
+  Ok((current, ByteSeq.join(&produced)))
+}
+
+/// One framing line and the bytes after its line break, or `None` while the line is incomplete.
+fn line(pending: &Bytes) -> Result[Option[(Str, Bytes)], Problem] {
+  let end = pending.indexOf(CRLF.toBytes())
+  if end < 0 {
+    if pending.length() > LINE_LIMIT { Err(Malformed("a framing line is longer than 8192 bytes")) } else { Ok(None) }
+  } else if end > LINE_LIMIT {
+    Err(Malformed("a framing line is longer than 8192 bytes"))
+  } else {
+    match ByteSeq.toText(&pending.take(end)) {
+      case Ok(text) => Ok(Some((text, pending.drop(end + 2))))
+      case Err(_) => Err(Malformed("a framing line is not text"))
+    }
+  }
+}
+
+/// The size a chunk-size line states, ignoring any extension after a semicolon.
+fn sizeOf(text: Str) -> Result[Int, Problem] {
+  let digits = text.split(";")[0].trim()
+  if digits.isEmpty() || digits.length() > 15 { return Err(Malformed("a chunk size is missing or too long")) }
+  var size = 0
+  for character in digits.chars() {
+    let digit = "0123456789abcdef".indexOf(character.toText().toLower())
+    if digit < 0 { return Err(Malformed("a chunk size is not hexadecimal: " + digits)) }
+    size = size * 16 + digit
+  }
+  Ok(size)
+}
+
+/// A trailer field as a name and a value.
+fn fieldOf(text: Str) -> Result[(Str, Str), Problem] {
+  let colon = text.indexOf(":")
+  if colon < 1 { Err(Malformed("a trailer field has no name")) } else { Ok((text.slice(0, colon).trim(), text.drop(colon + 1).trim())) }
+}

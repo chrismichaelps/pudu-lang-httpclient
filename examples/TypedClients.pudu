@@ -1,0 +1,61 @@
+/** @Examples.TypedClients.Program — a typed client reading and writing JSON values */
+module TypedClients
+
+import Std.Concurrent as Concurrent
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Io as Io
+import Std.Json as Json
+import Std.Option as Option
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Client.Json as JsonClient
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Response as Response
+
+/** @Examples.TypedClients.Todo — one item, written and read through derived implementations */
+type Todo = { id: Int, title: Str, done: Bool } derives Json.Encode, Json.Decode
+
+/** @Examples.TypedClients.Todos — a typed client: the operations of one remote service */
+type Todos = { client: Client.Client }
+
+/// The item with an identifier.
+fn find(todos: &Todos, id: Int) -> HttpClient.Outcome[Todo] { JsonClient.getFromJson(&todos.client, "todos/" + show(id)) }
+
+/// The item as the service stored it.
+fn add(todos: &Todos, todo: &Todo) -> HttpClient.Outcome[Todo] {
+  let response = Response.ensureSuccess(JsonClient.postAsJson(&todos.client, "todos", todo) ?) ?
+  Response.readAs(&response)
+}
+
+/// Starts a local service of items and answers its address.
+fn serve() -> (Server.Running, Str) {
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let server = Server.server(&Route.routing(&[
+        Route.get("/todos/:id", |request: Route.Request| Reply.json(200, "\{\"id\":" + Option.unwrapOr(Route.param(&request, "id"), "0") + ",\"title\":\"water the plants\",\"done\":false\}")),
+        Route.post("/todos", |request: Route.Request| Reply.json(201, Route.body(&request)))
+      ]))
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  (running, "http://127.0.0.1:" + show(Server.portOf(&running)) + "/")
+}
+
+/// Reads one item and adds another through a typed client, answering 0 when both round-trip.
+fn main() -> Int {
+  let (running, base) = serve()
+  let factory = match Factory.build([Builder.named("todos").withBaseAddress(base)]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let todos = Factory.typed(&factory, "todos", |client: Client.Client| Todos{client: client})
+  let found = find(&todos, 7)
+  let added = add(&todos, &Todo{id: 8, title: "write the docs", done: true})
+  let _said = Io.writeLine(show(found) + "\n" + show(added))
+  Factory.dispose(&factory)
+  let _stopped = Server.stop(&running)
+  if found == Ok(Todo{id: 7, title: "water the plants", done: false}) && added == Ok(Todo{id: 8, title: "write the docs", done: true}) { 0 } else { 1 }
+}

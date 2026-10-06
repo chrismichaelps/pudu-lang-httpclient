@@ -1,0 +1,41 @@
+/** @Test.Transport.Writer.Suite — requests written as the bytes that go on the wire */
+module PuduLangHttpClient.Transport.WriterTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Transport.Writer as Writer
+
+/// The text the writer produces for a request to its own endpoint.
+fn written(request: &Request.Request, version: Http.Version, form: Writer.Form, extra: &Array[(Str, Str)]) -> Str {
+  let endpoint = match Uri.endpointOf(request.uri) {
+    case Some(found) => found
+    case None => panic("no endpoint")
+  }
+  match Writer.render(request, &version, &endpoint, &form, extra).toText() {
+    case Some(text) => text
+    case None => ""
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let get = Request.get("http://api.test/v1/users?id=1#frag").withHeader("accept", "text/plain")
+  let posted = Request.post("https://api.test:8443/x", Content.plain("héllo")).withHeader("content-length", "999")
+  let checks = Test.suite("Transport.Writer", &[
+      Test.equals("a get names its origin-form target, its host, and its headers", &written(&get, Http.Http11, Writer.OriginForm, &[]), &"GET /v1/users?id=1 HTTP/1.1\r\nhost: api.test\r\naccept: text/plain\r\n\r\n"),
+      Test.equals("a body states its byte length and its own headers, replacing a stated length", &written(&posted, Http.Http11, Writer.OriginForm, &[]), &"POST /x HTTP/1.1\r\nhost: api.test:8443\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 6\r\n\r\nhéllo"),
+      Test.equals("a put without a body states a length of zero", &written(&Request.create(Http.Put, "http://a/"), Http.Http11, Writer.OriginForm, &[]), &"PUT / HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n"),
+      Test.equals("a proxied request names its absolute target and carries the route's headers", &written(&Request.get("http://a:81/p#x"), Http.Http10, Writer.AbsoluteForm, &[("proxy-authorization", "Basic eA==")]), &"GET http://a:81/p HTTP/1.0\r\nhost: a:81\r\nproxy-authorization: Basic eA==\r\n\r\n"),
+      Test.equals("a request naming its own host keeps it", &written(&Request.get("http://a/").withHeader("Host", "b"), Http.Http11, Writer.OriginForm, &[]), &"GET / HTTP/1.1\r\nHost: b\r\n\r\n"),
+      Test.equals("a request framed by chunks states no length", &written(&Request.post("http://a/", Content.plain("x")).withHeader("transfer-encoding", "chunked"), Http.Http11, Writer.OriginForm, &[]), &"POST / HTTP/1.1\r\nhost: a\r\ntransfer-encoding: chunked\r\ncontent-type: text/plain; charset=utf-8\r\n\r\nx")
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

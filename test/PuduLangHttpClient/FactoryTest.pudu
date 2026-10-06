@@ -1,0 +1,131 @@
+/** @Test.Factory.Suite — named clients over pipelines the factory owns and renews */
+module PuduLangHttpClient.FactoryTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Io as Io
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+import PuduLangHttpClient.Transport as Transport
+import Support.Loopback as Loopback
+
+/** @Test.Factory.Catalog — a typed client wrapping a named one */
+type Catalog = { client: Client.Client }
+
+/// The names of the items a typed client lists.
+fn itemsOf(catalog: &Catalog) -> HttpClient.Outcome[Str] { Client.getText(&catalog.client, "items") }
+
+/// A handler adding its name to the `trace` header.
+fn tracing(name: Str) -> Handler.Handler { Handler.before(|request: Request.Request| request.withHeader("trace", name)) }
+
+/// The text of a successful outcome, or the failure's description.
+fn textOf(outcome: &HttpClient.Outcome[Str]) -> Str {
+  match outcome {
+    case Ok(found) => found
+    case Err(failure) => HttpClient.describe(&failure)
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let server = Loopback.serve(&[
+      Route.get("/items", |_request: Route.Request| Reply.text(200, "tea,cake")),
+      Route.get("/trace", |request: Route.Request| Reply.text(200, request.message.headers.filter(|pair: (Str, Str)| pair[0] == "trace" || pair[0] == "user-agent").map(|pair: (Str, Str)| pair[1]).join(">")))
+    ])
+  let events = Sync.cell([])
+  let lock = Sync.mutex()
+  let options = Factory.Options{listeners: Events.listeners().onPipelineChanged(fn(event: Events.PipelineChanged) -> () {
+        let _recorded = Sync.withLock(&lock, fn() -> () { let _kept = Sync.set(&events, Result.unwrapOr(Sync.get(&events), []).push((event.client, event.generation, event.stage))) })
+      }) }
+  let stub = Stub.create()
+  Stub.respond(&stub, Http.Get, "/ping", 200, "pong")
+  let built = Factory.buildWith(&options, [
+      Builder.defaults().withDefaultHeader("user-agent", "shop/1").withHandler(tracing("default")),
+      Builder.named("catalog").withBaseAddress(server.base + "/").withHandler(tracing("first")),
+      Builder.named("catalog").withHandler(tracing("second")).configureHandlers(|handlers: Array[Handler.Handler]| handlers.reverse()),
+      Builder.named("rotating").withBaseAddress(server.base + "/").withHandlerLifetime(30),
+      Builder.named("stubbed").withPrimary(|| Stub.send(&stub)).withBaseAddress("http://stub.test/"),
+      Builder.named("tuned").withTransport(Transport.defaults().withMaxConnectionsPerServer(2)).configureTransport(|options: Transport.Options| options.withPooledConnectionIdleTimeout(10)).withTimeout(Defaults.INFINITE)
+    ])
+  let factory = match built {
+    case Ok(found) => found
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let catalog = Factory.typed(&factory, "catalog", |client: Client.Client| Catalog{client: client})
+  let items = itemsOf(&catalog)
+  let traced = Client.getText(&Factory.createClient(&factory, "catalog"), "trace")
+  let sameHandler = Factory.statistics(&factory, "catalog")
+  let unnamed = Factory.client(&factory)
+  let stubbed = Client.getText(&Factory.createClient(&factory, "stubbed"), "ping")
+
+  let first = Client.getText(&Factory.createClient(&factory, "rotating"), "items")
+  let firstStats = Factory.statistics(&factory, "rotating")
+  let _rested = Concurrent.sleep(40)
+  let rotatingSender = Factory.rotatingHandler(&factory, "rotating")
+  let second = rotatingSender(Request.get(server.base + "/items"), Cancel.expiring(5000))
+  let pendingAfterRotation = Factory.pendingExpired(&factory)
+  let _graced = Concurrent.sleep(40)
+  let _third = Client.getText(&Factory.createClient(&factory, "rotating"), "items")
+  let lifecycle = Result.unwrapOr(Sync.get(&events), [])
+  Factory.dispose(&factory)
+  let afterDispose = Result.unwrapOr(Sync.get(&events), []).length() > lifecycle.length()
+  let stillWorks = Client.getText(&catalog.client, "items")
+  Loopback.stop(&server)
+
+  let invalid = Factory.build([
+      Builder.defaults().withTimeout(-3),
+      Builder.named("bad").withBaseAddress("relative/").withHandlerLifetime(-7).withTransport(Transport.defaults().withMaxConnectionsPerServer(0))
+    ])
+  let problems = match invalid {
+    case Ok(_) => []
+    case Err(found) => found.problems
+  }
+  let checks = Test.suite("Factory", &[
+      Test.equals("a typed client wraps a named client", &items, &Ok("tea,cake")),
+      Test.equals("defaults apply first, then a name's builders in order, then its rearrangement", &textOf(&traced), &"shop/1>second>first>default"),
+      Test.that("a named pipeline keeps its connections between clients", match sameHandler {
+          case Some(stats) => stats.reused >= 1 && stats.opened == 1
+          case None => false
+        }),
+      Test.equals("an unconfigured name gets the defaults", &(unnamed.name, unnamed.defaultHeaders, unnamed.baseAddress), &("", [("user-agent", "shop/1")], None)),
+      Test.equals("a primary handler of the program's own is used", &stubbed, &Ok("pong")),
+      Test.equals("a stub has no connection counters", &Factory.statistics(&factory, "stubbed"), &None),
+      Test.equals("the names configured on their own are listed", &Factory.names(&factory), &["catalog", "rotating", "stubbed", "tuned"]),
+      Test.equals("a client of a pipeline that expired still answers", &(first, Result.map(second, |r: Response.Response| r.status.code)), &(Ok("tea,cake"), Ok(200))),
+      Test.that("a pipeline's first transport opened its connection", match firstStats {
+          case Some(stats) => stats.opened == 1
+          case None => false
+        }),
+      Test.equals("an expired pipeline waits out its grace before closing", &pendingAfterRotation, &1),
+      Test.that("pipelines were created, expired, and closed in turn", lifecycle == [("catalog", 1, Events.Created), ("", 2, Events.Created), ("stubbed", 3, Events.Created), ("rotating", 4, Events.Created), ("rotating", 5, Events.Created), ("rotating", 4, Events.Expired), ("rotating", 6, Events.Created), ("rotating", 5, Events.Expired), ("rotating", 4, Events.Closed)]),
+      Test.that("disposing closes every pipeline and says so", afterDispose),
+      Test.equals("a client made before disposing still answers", &stillWorks, &Ok("tea,cake")),
+      Test.equals("every problem of every name is reported at once", &problems, &[
+          "client 'bad': baseAddress must be an absolute http or https address: relative/",
+          "client 'bad': timeout must be positive or INFINITE",
+          "client 'bad': handlerLifetime must be at least 0 ms or INFINITE",
+          "client 'bad': maxConnectionsPerServer must be at least 1",
+          "client '(defaults)': timeout must be positive or INFINITE"
+        ]),
+      Test.that("the problems are explained in one sentence", Factory.explain(&Factory.Invalid{problems: ["a", "b"]}) == "The client factory is invalid: a; b")
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

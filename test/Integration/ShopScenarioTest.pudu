@@ -1,0 +1,94 @@
+/** @Test.Integration.ShopScenario.Suite — one shop wired through the factory end to end */
+module Integration.ShopScenarioTest
+
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Io as Io
+import Std.Json as Json
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Client.Json as JsonClient
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Handlers.Authorization as Authorization
+import PuduLangHttpClient.Handlers.Logging as Logging
+import PuduLangHttpClient.Handlers.Metrics as Metrics
+import PuduLangHttpClient.Handlers.Resilience as Resilience
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport as Transport
+import PuduLangLog.Configuration as Configuration
+import PuduLangLog as Log
+import PuduLangLog.Sinks.Memory as Memory
+import PuduLangResilience.Retry as Retry
+import Support.Loopback as Loopback
+
+/** @Test.Integration.ShopScenario.Product — a catalog entry read through a derived decoder */
+type Product = { sku: Str, price: Int } derives Json.Encode, Json.Decode
+
+/** @Test.Integration.ShopScenario.Catalog — a typed client over the named catalog client */
+type Catalog = { client: Client.Client }
+
+/// The product with a stock-keeping unit.
+fn product(catalog: &Catalog, sku: Str) -> HttpClient.Outcome[Product] { JsonClient.getFromJson(&catalog.client, "products/" + sku) }
+
+/// Runs the suite.
+fn main() -> Int {
+  let attempts = Sync.counter(0)
+  let server = Loopback.serve(&[
+      Route.get("/products/:sku", fn(request: Route.Request) -> Http.Response {
+          let attempt = Result.unwrapOr(Sync.increment(&attempts, 1), 0)
+          if Route.header(&request, "authorization") != Some("Bearer t1") { return Reply.text(401, "who are you") }
+          if attempt == 1 { return Http.Response{..Reply.text(503, "busy"), headers: [("retry-after", "0")]} }
+          Reply.json(200, "\{\"sku\":\"" + match Route.param(&request, "sku") { case Some(found) => found case None => "" } + "\",\"price\":42\}")
+        }),
+      Route.post("/orders", |request: Route.Request| Reply.text(201, Route.body(&request)))
+    ])
+  let memory = Memory.create()
+  let logger = Configuration.create().minimumLevel(Log.Information).writeTo(Memory.sink(&memory)).createLogger()
+  let meter = Metrics.meter()
+  let completions = Sync.counter(0)
+  let listeners = Events.listeners().onRequestCompleted(fn(_event: Events.RequestCompleted) -> () { let _counted = Sync.increment(&completions, 1) })
+  let quickRetry = Resilience.Standard{..Resilience.standardOptions(), retry: Retry.Options{..Resilience.standardOptions().retry, delay: 1, useJitter: false}}
+  let resilient = match Resilience.standardWith(&quickRetry) {
+    case Ok(found) => found
+    case Err(_) => panic("the standard pipeline did not build")
+  }
+  let factory = match Factory.buildWith(&Factory.Options{listeners: listeners}, [
+      Builder.defaults().observedBy(Logging.observer(logger)).withHandler(Metrics.handler(&meter)).withDefaultHeader("user-agent", "shop/1.0"),
+      Builder.named("catalog").withBaseAddress(server.base + "/").withHandler(Resilience.handler(resilient)).withHandler(Authorization.bearer(|_refresh: Bool| Ok("t1"))).withTransport(Transport.defaults().withMaxConnectionsPerServer(4)),
+      Builder.named("orders").withBaseAddress(server.base + "/").withTimeout(5000)
+    ]) {
+    case Ok(found) => found
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let catalog = Factory.typed(&factory, "catalog", |client: Client.Client| Catalog{client: client})
+  let tea = product(&catalog, "tea")
+  let cake = product(&catalog, "cake")
+  let ordered = Result.andThen(JsonClient.postAsJson(&Factory.createClient(&factory, "orders"), "orders", &Product{sku: "tea", price: 42}), |r: Response.Response| Response.readAs[Product](&r))
+  let snapshot = Metrics.snapshot(&meter)
+  let connections = Factory.statistics(&factory, "catalog")
+  Factory.dispose(&factory)
+  Loopback.stop(&server)
+  let checks = Test.suite("Integration.ShopScenario", &[
+      Test.equals("a typed client reads products after a busy answer is retried", &(tea, cake), &(Ok(Product{sku: "tea", price: 42}), Ok(Product{sku: "cake", price: 42}))),
+      Test.equals("an order posted as JSON comes back as JSON", &ordered, &Ok(Product{sku: "tea", price: 42})),
+      Test.equals("the server saw the retried attempt", &Result.unwrapOr(Sync.count(&attempts), 0), &3),
+      Test.equals("metrics count each request once, outside the retries", &(snapshot.requests, snapshot.successful), &(3, 3)),
+      Test.equals("every request was announced as completed", &Result.unwrapOr(Sync.count(&completions), 0), &3),
+      Test.that("the catalog's connection was kept alive across attempts", match connections {
+          case Some(stats) => stats.opened == 1 && stats.reused == 2
+          case None => false
+        }),
+      Test.that("the logical handler logged each request", Memory.withTemplate(&memory, "Start processing HTTP request \{Method\} \{Uri\}").length() == 3)
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

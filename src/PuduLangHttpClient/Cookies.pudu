@@ -1,0 +1,83 @@
+/** @HttpClient.Cookies.Module — a jar of cookies shared by the requests of one transport */
+module PuduLangHttpClient.Cookies
+
+import Std.Json as Json
+import Std.Time as Time
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Cookie as Cookie
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Utils.Shared as Shared
+
+/** @HttpClient.Cookies.Jar — the cookies stored so far, shared between threads */
+export type Jar = { held: Shared.Shared[Array[Cookie.Stored]] }
+
+/// An empty jar.
+export fn jar() -> Jar { Jar{held: Shared.shared([])} }
+
+/// Stores the cookies a response from `uri` set through its `set-cookie` values.
+export fn store(target: &Jar, uri: Str, values: &Array[Str]) -> () {
+  if let Some(endpoint) = Uri.endpointOf(uri) {
+    let now = wallClock()
+    let path = Uri.split(uri).path
+    for value in values {
+      if let Some(cookie) = Cookie.parse(value, endpoint.host, path, now) {
+        Shared.update(&target.held, |held: Array[Cookie.Stored]| Cookie.store(&held, &cookie, now))
+      }
+    }
+  }
+}
+
+/// Adds one cookie for `uri`, as though its response had set it.
+export fn add(target: &Jar, uri: Str, name: Str, value: Str) -> () { store(target, uri, &[name + "=" + value]) }
+
+/// The cookies a request to `uri` carries.
+export fn cookiesFor(source: &Jar, uri: Str) -> Array[Cookie.Stored] {
+  match Uri.endpointOf(uri) {
+    case Some(endpoint) => {
+      let now = wallClock()
+      let path = Uri.split(uri).path
+      Shared.current(&source.held).filter(|cookie: Cookie.Stored| Cookie.applies(&cookie, endpoint.host, path, endpoint.secure, now))
+    }
+    case None => []
+  }
+}
+
+/// The `cookie` header value a request to `uri` carries, or `None` when no cookie applies.
+export fn header(source: &Jar, uri: Str) -> Option[Str] {
+  let applying = cookiesFor(source, uri)
+  if applying.isEmpty() { None } else { Some(Cookie.render(&applying)) }
+}
+
+/// Every cookie that has not expired.
+export fn cookies(source: &Jar) -> Array[Cookie.Stored] {
+  let now = wallClock()
+  Shared.current(&source.held).filter(|cookie: Cookie.Stored| !Cookie.expired(&cookie, now))
+}
+
+/// Removes every cookie.
+export fn clear(target: &Jar) -> () { Shared.update(&target.held, |_held: Array[Cookie.Stored]| []) }
+
+/// Removes every cookie without an expiry, which lasts only as long as the session.
+export fn clearSession(target: &Jar) -> () {
+  Shared.update(&target.held, |held: Array[Cookie.Stored]| held.filter(|cookie: Cookie.Stored| Cookie.isPersistent(&cookie)))
+}
+
+/// Every cookie that lasts beyond the session, as JSON a later `restore` reads back.
+export fn save(source: &Jar) -> Str {
+  Json.encode(&cookies(source).filter(|cookie: Cookie.Stored| Cookie.isPersistent(&cookie)).encode())
+}
+
+/// Stores every unexpired cookie a `save` wrote, replacing cookies of the same name, domain, and
+/// path; text that is not a saved jar is `Unreadable`.
+export fn restore(target: &Jar, saved: Str) -> HttpClient.Outcome[()] {
+  let restored: Array[Cookie.Stored] = Content.readAs(&Content.plain(saved)) ?
+  let now = wallClock()
+  for cookie in restored {
+    Shared.update(&target.held, |held: Array[Cookie.Stored]| Cookie.store(&held, &cookie, now))
+  }
+  Ok(())
+}
+
+/// Milliseconds since the Unix epoch, the clock cookie expiries are written in.
+fn wallClock() -> Int { Time.toMillis(&Time.currentInstant()) }

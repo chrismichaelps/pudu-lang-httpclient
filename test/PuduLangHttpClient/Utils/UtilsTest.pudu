@@ -1,0 +1,55 @@
+/** @Test.Utils.Suite — templates, shared state, and linked tokens */
+module PuduLangHttpClient.Utils.UtilsTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Utils.Shared as Shared
+import PuduLangHttpClient.Utils.Template as Template
+import PuduLangHttpClient.Utils.Tokens as Tokens
+
+/// Runs the suite.
+fn main() -> Int {
+  let counter = Shared.shared(0)
+  let workers = [1, 2, 3, 4, 5, 6, 7, 8].map(|_n: Int| match Concurrent.start(fn() -> () {
+        var index = 0
+        while index < 100 {
+          Shared.update(&counter, |count: Int| count + 1)
+          index = index + 1
+        }
+      }) {
+      case Ok(started) => started
+      case Err(problem) => panic(show(problem))
+    })
+  let _joined = Concurrent.joinAll(&workers)
+  let parent = Cancel.token()
+  let other = Cancel.token()
+  let linked = Tokens.linked(&[parent, other], Defaults.INFINITE)
+  let quiet = Cancel.stopped(&linked)
+  let _cancelled = Cancel.cancel(&other, "other stopped")
+  let child = Tokens.linked(&[Cancel.token()], Defaults.INFINITE)
+  let _own = Cancel.cancel(&child, "child only")
+  let expiring = Tokens.linked(&[Cancel.expiring(10000)], 5)
+  let _waited = Concurrent.sleep(20)
+  let inherited = Tokens.linked(&[Cancel.expiring(5)], 10000)
+  let checks = Test.suite("Utils", &[
+      Test.equals("slots are filled once, in order", &Template.fill("<1> and <2> but not <3>", &["a", "<2>"]), &"a and <2> but not <3>"),
+      Test.equals("concurrent updates are never lost", &Shared.current(&counter), &800),
+      Test.equals("a change answers what its step computed", &Shared.change(&counter, |count: Int| (count + 1, count * 2)), &1600),
+      Test.that("a linked token is quiet until a parent fires", !quiet && Cancel.stopped(&linked)),
+      Test.equals("a linked token reports the parent's reason", &Cancel.reason(&linked), &Some(Cancel.Requested("other stopped"))),
+      Test.not("cancelling a linked token leaves its parents running", Cancel.stopped(&parent)),
+      Test.that("a linked token fires on its own", Cancel.stopped(&child)),
+      Test.that("a linked token's own timeout fires before a parent's later deadline", Cancel.stopped(&expiring)),
+      Test.that("a parent's earlier deadline is inherited", Cancel.remaining(&inherited) != None && Cancel.remaining(&inherited) != Some(10000)),
+      Test.equals("an infinite timeout without a deadline leaves none", &Cancel.remaining(&Tokens.linked(&[Cancel.token()], Defaults.INFINITE)), &None),
+      Test.that("a negative timeout fires at once", Cancel.stopped(&Tokens.linked(&[], -5)))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

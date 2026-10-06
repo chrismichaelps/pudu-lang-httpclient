@@ -1,0 +1,33 @@
+/** @Test.Request.Suite — requests built one decision at a time */
+module PuduLangHttpClient.RequestTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient.Options as Options
+import PuduLangHttpClient.Request as Request
+
+/// Runs the suite.
+fn main() -> Int {
+  let tenant = Options.textKey("tenant")
+  let shaped = Request.get("/items").withHeader("x-a", "1").withHeader("X-A", "2").setHeader("x-b", "3").removeHeader("x-a").withVersion(Http.Http10, Version.Exact).withOption(&tenant, "acme").withBearer("t0k").accepting("application/json")
+  let posted = Request.post("/items", Content.plain("x"))
+  let checks = Test.suite("Request", &[
+      Test.equals("a new request is HTTP/1.1 or lower with nothing else", &Request.create(Http.Options, "*"), &Request.Request{method: Http.Options, uri: "*", version: Http.Http11, versionPolicy: Version.OrLower, headers: [], content: None, options: Options.empty(), receiver: None}),
+      Test.equals("each verb names its method", &[Request.get("/").method, Request.head("/").method, Request.delete("/").method, posted.method, Request.put("/", Content.empty()).method, Request.patch("/", Content.empty()).method], &[Http.Get, Http.Head, Http.Delete, Http.Post, Http.Put, Http.Patch]),
+      Test.equals("a verb with a body carries it", &(posted.content, Request.put("/", Content.plain("p")).content, Request.patch("/", Content.plain("q")).content), &(Some(Content.plain("x")), Some(Content.plain("p")), Some(Content.plain("q")))),
+      Test.equals("headers are added, set, and removed", &shaped.headers, &[("x-b", "3"), ("authorization", "Bearer t0k"), ("accept", "application/json")]),
+      Test.equals("the version and policy are kept", &(shaped.version, shaped.versionPolicy), &(Http.Http10, Version.Exact)),
+      Test.equals("an option reads back", &Request.option(&shaped, &tenant), &Some("acme")),
+      Test.equals("a header is found among the request's own and then its body's", &(Request.header(&posted.withHeader("Accept", "*/*"), "accept"), Request.header(&posted, "Content-Type"), Request.header(&Request.get("/"), "content-type")), &(Some("*/*"), Some("text/plain; charset=utf-8"), None)),
+      Test.equals("content replaces content", &Request.get("/").withContent(Content.plain("a")).withContent(Content.plain("b")).content, &Some(Content.plain("b"))),
+      Test.that("a receiver is attached", Request.get("/").withReceiver(|_piece: Bytes| true).receiver != None)
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

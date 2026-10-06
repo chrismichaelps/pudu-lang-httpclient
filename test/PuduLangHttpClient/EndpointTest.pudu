@@ -1,0 +1,48 @@
+/** @Test.Endpoint.Suite — declarative endpoints filled, sent, and read */
+module PuduLangHttpClient.EndpointTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Json as Json
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Endpoint as Endpoint
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+
+/** @Test.Endpoint.Todo — one item read and written through derived implementations */
+type Todo = { userId: Int, title: Str } derives Json.Encode, Json.Decode
+
+/// Runs the suite.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.when(&stub, |request: Request.Request| request.uri.contains("/users/7/todos"), fn(request: Request.Request) -> HttpClient.Outcome[Response.Response] {
+      let body = match request.content {
+        case Some(found) => Result.unwrapOr(Content.readText(&found), "")
+        case None => "\{\"userId\":7,\"title\":\"" + Http.methodName(&request.method) + "\"\}"
+      }
+      Ok(Response.answer(&request, 200).withContent(Content.text(body, "application/json")))
+    })
+  let client = Client.create(Stub.send(&stub)).withBaseAddress("https://api.test/")
+  let listing = Endpoint.get("users/:userId/todos?q=:query")
+  let creating = Endpoint.post("users/:userId/todos")
+  let checks = Test.suite("Endpoint", &[
+      Test.equals("slots are filled with encoded arguments", &Endpoint.fill(&listing, &[("query", "a b/c?"), ("userId", "7")]), &Ok("users/7/todos?q=a%20b%2Fc%3F")),
+      Test.equals("a slot without an argument is refused", &Endpoint.fill(&listing, &[("userId", "7")]), &Err(HttpClient.InvalidRequest("the template slot 'query' has no argument"))),
+      Test.equals("a colon that does not start a name is kept", &(Endpoint.fill(&Endpoint.get("health"), &[]), Endpoint.fill(&Endpoint.get("http://h:8080/a:/:_x:1"), &[])), &(Ok("health"), Ok("http://h:8080/a:/:_x:1"))),
+      Test.equals("a call reads a derived value", &Endpoint.call[Todo](&client, &listing, &[("userId", "7"), ("query", "x")]), &Ok(Todo{userId: 7, title: "GET"})),
+      Test.equals("a call with a body writes one", &Endpoint.callWith[Todo, Todo](&client, &creating, &[("userId", "7")], &Todo{userId: 7, title: "new"}), &Ok(Todo{userId: 7, title: "new"})),
+      Test.equals("each verb names its method", &[Endpoint.get("x").method, Endpoint.post("x").method, Endpoint.put("x").method, Endpoint.patch("x").method, Endpoint.delete("x").method], &[Http.Get, Http.Post, Http.Put, Http.Patch, Http.Delete]),
+      Test.equals("a failed status is not decoded", &Endpoint.call[Todo](&client, &Endpoint.delete("users/:id"), &[("id", "1")]), &Err(HttpClient.Unsuccessful(404, "Not Found"))),
+      Test.equals("an endpoint request asks for JSON", &Result.map(Endpoint.request(&client, &creating, &[("userId", "1")]), |r: Request.Request| Request.header(&r, "accept")), &Ok(Some("application/json")))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

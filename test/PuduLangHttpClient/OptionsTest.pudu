@@ -1,0 +1,27 @@
+/** @Test.Options.Suite — typed values a request carries for its handlers */
+module PuduLangHttpClient.OptionsTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Options as Options
+
+/// Runs the suite.
+fn main() -> Int {
+  let tenant = Options.textKey("tenant")
+  let attempts = Options.intKey("attempts")
+  let traced = Options.boolKey("traced")
+  let options = Options.set(&Options.set(&Options.set(&Options.empty(), &tenant, "acme"), &attempts, 3), &traced, false)
+  let checks = Test.suite("Options", &[
+      Test.equals("each key reads back its own value", &(Options.get(&options, &tenant), Options.get(&options, &attempts), Options.get(&options, &traced)), &(Some("acme"), Some(3), Some(false))),
+      Test.equals("a flag reads back true", &Options.get(&Options.set(&options, &traced, true), &traced), &Some(true)),
+      Test.equals("a value that does not read back as the key's type is absent", &(Options.get(&options, &Options.intKey("tenant")), Options.get(&options, &Options.boolKey("attempts"))), &(None, None)),
+      Test.that("a key is present once set and absent once removed", Options.has(&options, &tenant) && !Options.has(&Options.remove(&options, &tenant), &tenant)),
+      Test.equals("names are listed in order", &Options.names(&options), &["attempts", "tenant", "traced"]),
+      Test.equals("a custom key writes and reads its own way", &Options.get(&Options.set(&Options.empty(), &Options.key("pair", |pair: (Int, Int)| show(pair[0]) + "," + show(pair[1]), |text: Str| Some((0, text.length()))), (1, 2)), &Options.key("pair", |pair: (Int, Int)| "", |text: Str| Some((9, text.length())))), &Some((9, 3)))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

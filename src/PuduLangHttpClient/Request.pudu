@@ -1,0 +1,120 @@
+/** @HttpClient.Request.Module — what a client sends, built before anything is sent */
+module PuduLangHttpClient.Request
+
+import Std.Http as Http
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient.Options as Options
+
+/** @HttpClient.Request.Receiver — takes each piece of a streamed body; `false` stops reading */
+export type Receiver = fn(Bytes) -> Bool
+
+/** @HttpClient.Request.Request — a method, an address, headers, an optional body, and options */
+export type Request = {
+  method: Http.Method,
+  uri: Str,
+  version: Http.Version,
+  versionPolicy: Version.Policy,
+  headers: Array[(Str, Str)],
+  content: Option[Content.Content],
+  options: Options.Options,
+  receiver: Option[Receiver]
+}
+
+/// A request with a method and an address, sent as HTTP/1.1 or lower, with nothing else.
+export fn create(method: Http.Method, uri: Str) -> Request {
+  Request {
+    method: method,
+    uri: uri,
+    version: Http.Http11,
+    versionPolicy: Version.OrLower,
+    headers: [],
+    content: None,
+    options: Options.empty(),
+    receiver: None
+  }
+}
+
+/// A `GET` request.
+export fn get(uri: Str) -> Request { create(Http.Get, uri) }
+
+/// A `HEAD` request.
+export fn head(uri: Str) -> Request { create(Http.Head, uri) }
+
+/// A `DELETE` request.
+export fn delete(uri: Str) -> Request { create(Http.Delete, uri) }
+
+/// A `POST` request carrying a body.
+export fn post(uri: Str, content: Content.Content) -> Request { Request{..create(Http.Post, uri), content: Some(content)} }
+
+/// A `PUT` request carrying a body.
+export fn put(uri: Str, content: Content.Content) -> Request { Request{..create(Http.Put, uri), content: Some(content)} }
+
+/// A `PATCH` request carrying a body.
+export fn patch(uri: Str, content: Content.Content) -> Request { Request{..create(Http.Patch, uri), content: Some(content)} }
+
+/// The first value of a header, among the request's own headers and then its body's.
+export fn header(request: &Request, name: Str) -> Option[Str] {
+  match Headers.get(&request.headers, name) {
+    case Some(found) => Some(found)
+    case None => {
+      let content = request.content ?
+      Headers.get(&content.headers, name)
+    }
+  }
+}
+
+/// The value of an option, when it is set.
+export fn option[T](request: &Request, name: &Options.Key[T]) -> Option[T] { Options.get(&request.options, name) }
+
+/** @HttpClient.Request.Shaping — a request changed one decision at a time */
+export trait Shaping {
+  /// The request with a header value added after any the name has.
+  fn withHeader(self: &Self, name: Str, value: Str) -> Self
+  /// The request with every value of a header replaced by one.
+  fn setHeader(self: &Self, name: Str, value: Str) -> Self
+  /// The request without a header.
+  fn removeHeader(self: &Self, name: Str) -> Self
+  /// The request carrying a body.
+  fn withContent(self: &Self, content: Content.Content) -> Self
+  /// The request sent with a protocol version under a policy.
+  fn withVersion(self: &Self, version: Http.Version, policy: Version.Policy) -> Self
+  /// The request carrying an option for its handlers.
+  fn withOption[T](self: &Self, name: &Options.Key[T], value: T) -> Self
+  /// The request whose body is handed to a receiver as it arrives instead of being buffered.
+  fn withReceiver(self: &Self, receiver: Receiver) -> Self
+  /// The request authorized with a bearer token.
+  fn withBearer(self: &Self, token: Str) -> Self
+  /// The request asking for a media type.
+  fn accepting(self: &Self, mediaType: Str) -> Self
+}
+
+impl Shaping for Request {
+  /// The request with a header value added after any the name has.
+  fn withHeader(self: &Self, name: Str, value: Str) -> Self { Request{..*self, headers: Headers.add(&self.headers, name, value)} }
+
+  /// The request with every value of a header replaced by one.
+  fn setHeader(self: &Self, name: Str, value: Str) -> Self { Request{..*self, headers: Headers.set(&self.headers, name, value)} }
+
+  /// The request without a header.
+  fn removeHeader(self: &Self, name: Str) -> Self { Request{..*self, headers: Headers.remove(&self.headers, name)} }
+
+  /// The request carrying a body.
+  fn withContent(self: &Self, content: Content.Content) -> Self { Request{..*self, content: Some(content)} }
+
+  /// The request sent with a protocol version under a policy.
+  fn withVersion(self: &Self, version: Http.Version, policy: Version.Policy) -> Self { Request{..*self, version: version, versionPolicy: policy} }
+
+  /// The request carrying an option for its handlers.
+  fn withOption[T](self: &Self, name: &Options.Key[T], value: T) -> Self { Request{..*self, options: Options.set(&self.options, name, value)} }
+
+  /// The request whose body is handed to a receiver as it arrives instead of being buffered.
+  fn withReceiver(self: &Self, receiver: Receiver) -> Self { Request{..*self, receiver: Some(receiver)} }
+
+  /// The request authorized with a bearer token.
+  fn withBearer(self: &Self, token: Str) -> Self { self.setHeader("authorization", Http.bearerAuth(token)) }
+
+  /// The request asking for a media type.
+  fn accepting(self: &Self, mediaType: Str) -> Self { self.withHeader("accept", mediaType) }
+}

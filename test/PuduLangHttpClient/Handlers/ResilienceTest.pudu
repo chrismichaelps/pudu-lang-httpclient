@@ -1,0 +1,156 @@
+/** @Test.Handlers.Resilience.Suite — requests sent through resilience pipelines tuned for HTTP */
+module PuduLangHttpClient.Handlers.ResilienceTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Io as Io
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Handlers.Resilience as Resilience
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Utils.Shared as Shared
+import PuduLangResilience.CircuitBreaker as CircuitBreaker
+import PuduLangResilience.Context as Guard
+import PuduLangResilience as Guarded
+import PuduLangResilience.Pipeline as Pipeline
+import PuduLangResilience.Predicate as Predicate
+import PuduLangResilience.RateLimiter as RateLimiter
+import PuduLangResilience.Registry as Registry
+import PuduLangResilience.Retry as Retry
+import PuduLangResilience.Timeout as Timeout
+
+/// A primary handler answering the scripted statuses in turn, then 200, counting every call.
+fn scripted(calls: &Shared.Shared[Int], statuses: Array[Int]) -> Handler.Send {
+  let counter = *calls
+  fn(request: Request.Request, _token: Cancel.Token) -> HttpClient.Outcome[Response.Response] {
+    let index = Shared.change(&counter, |count: Int| (count + 1, count))
+    let code = if index < statuses.length() { statuses[index] } else { 200 }
+    if code == 0 { Err(HttpClient.Connection("reset")) } else if code < 0 { Err(HttpClient.InvalidRequest("bad")) } else { Ok(Response.answer(&request, code)) }
+  }
+}
+
+/// A primary handler that waits for its token, as the transport does.
+fn waiting(request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] {
+  let began = clock()
+  match Cancel.pause(&token, 3000) {
+    case Ok(_) => Ok(Response.answer(&request, 200))
+    case Err(Cancel.Requested(reason)) => Err(HttpClient.Cancelled(reason))
+    case Err(Cancel.DeadlineExceeded) => Err(HttpClient.TimedOut(clock() - began))
+  }
+}
+
+/// The pipeline the options build, which the suite's options always do.
+fn built(outcome: Result[Resilience.Guarding, Pipeline.Invalid]) -> Resilience.Guarding {
+  match outcome {
+    case Ok(found) => found
+    case Err(invalid) => panic(Pipeline.explain(&invalid))
+  }
+}
+
+/// The status or failure a handler answers around a primary handler.
+fn sent(handler: Handler.Handler, primary: Handler.Send, request: Request.Request, token: Cancel.Token) -> Result[Int, HttpClient.Failure] {
+  Result.map(Handler.around(handler, primary)(request, token), |response: Response.Response| response.status.code)
+}
+
+/// Whether an outcome is a rejection.
+fn rejected(outcome: &Result[Int, HttpClient.Failure]) -> Bool {
+  match outcome {
+    case Err(HttpClient.Rejected(_)) => true
+    case _ => false
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let quick = Resilience.Standard{..Resilience.standardOptions(), retry: Retry.Options{..Resilience.standardOptions().retry, delay: 1, useJitter: false}}
+  let pipeline = built(Resilience.standardWith(&quick))
+  let calls = Shared.shared(0)
+  let recovered = sent(Resilience.handler(pipeline), scripted(&calls, [503, 0, 429]), Request.get("http://a/"), Cancel.token())
+  let recoveredCalls = Shared.current(&calls)
+  let exhaustedCalls = Shared.shared(0)
+  let exhausted = sent(Resilience.handler(pipeline), scripted(&exhaustedCalls, [500, 502, 503, 504, 200]), Request.get("http://a/"), Cancel.token())
+  let fatalCalls = Shared.shared(0)
+  let fatal = sent(Resilience.handler(pipeline), scripted(&fatalCalls, [-1]), Request.get("http://a/"), Cancel.token())
+  let notFoundCalls = Shared.shared(0)
+  let notFound = sent(Resilience.handler(pipeline), scripted(&notFoundCalls, [404]), Request.get("http://a/"), Cancel.token())
+
+  let breaker = built(Pipeline.build([CircuitBreaker.strategy(CircuitBreaker.Options{..CircuitBreaker.defaults(), shouldHandle: Resilience.transient(), failureRatio: 0.5d, minimumThroughput: 2, samplingDuration: 1000, breakDuration: 1000})]))
+  let breakerCalls = Shared.shared(0)
+  let breaking = Resilience.handler(breaker)
+  let first = sent(breaking, scripted(&breakerCalls, [503, 503, 200]), Request.get("http://a/"), Cancel.token())
+  let second = sent(breaking, scripted(&breakerCalls, [503, 503, 200]), Request.get("http://a/"), Cancel.token())
+  let opened = sent(breaking, scripted(&breakerCalls, [503, 503, 200]), Request.get("http://a/"), Cancel.token())
+
+  let attemptTimeout = sent(Resilience.handler(built(Pipeline.build([Timeout.strategy(Timeout.after(40))]))), waiting, Request.get("http://a/"), Cancel.token())
+  let callerDeadline = sent(Resilience.handler(built(Pipeline.build([Timeout.strategy(Timeout.after(5000))]))), waiting, Request.get("http://a/"), Cancel.expiring(30))
+  let stopping = Cancel.token()
+  let _stopped = Cancel.cancel(&stopping, "caller")
+  let callerCancelled = sent(Resilience.handler(built(Pipeline.build([Timeout.strategy(Timeout.after(5000))]))), waiting, Request.get("http://a/"), stopping)
+
+  let limiter = Resilience.handler(built(Pipeline.build([RateLimiter.strategy(RateLimiter.concurrency(1, 0))])))
+  let holder = Cancel.token()
+  let held = match Concurrent.start(fn() -> () { let _held = sent(limiter, waiting, Request.get("http://a/"), holder) }) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let _settle = Concurrent.sleep(30)
+  let limited = sent(limiter, waiting, Request.get("http://a/"), Cancel.token())
+  let _released = Cancel.cancel(&holder, "done")
+  let _joined = Concurrent.join(&held)
+
+  let readsOnly = Resilience.selecting(|request: Request.Request| if request.method == Http.Get { pipeline } else { Pipeline.empty() })
+  let getCalls = Shared.shared(0)
+  let postCalls = Shared.shared(0)
+  let selectedGet = sent(readsOnly, scripted(&getCalls, [503]), Request.get("http://a/"), Cancel.token())
+  let selectedPost = sent(readsOnly, scripted(&postCalls, [503]), Request.create(Http.Post, "http://a/"), Cancel.token())
+
+  let registry: Registry.Registry[Response.Response, HttpClient.Failure] = Registry.create()
+  let _added = Registry.tryAddBuilder(&registry, "api", |_context: Registry.BuilderContext| [Retry.strategy(Retry.Options{..Retry.defaults(), shouldHandle: Resilience.transient(), delay: 1})])
+  let registryCalls = Shared.shared(0)
+  let fromRegistry = sent(Resilience.fromRegistry(&registry, "api"), scripted(&registryCalls, [500]), Request.get("http://a/"), Cancel.token())
+  let missingKey = sent(Resilience.fromRegistry(&registry, "other"), scripted(&registryCalls, []), Request.get("http://a/"), Cancel.token())
+
+  let onTransientCalls = Shared.shared(0)
+  let onTransient = sent(Resilience.handler(built(Resilience.onTransient(|handles: Predicate.Predicate[Response.Response, HttpClient.Failure]| [Retry.strategy(Retry.Options{..Retry.defaults(), shouldHandle: handles, delay: 1})]))), scripted(&onTransientCalls, [503, 429]), Request.get("http://a/"), Cancel.token())
+
+  let answer = Response.answer(&Request.get("http://a/"), 503).withHeader("retry-after", "2")
+  let handled = Resilience.retryAfter(Predicate.arguments(Ok(answer), Guard.create(), 0))
+  let unhandled = Resilience.retryAfter(Predicate.arguments(Err(Guarded.TimedOut(1)), Guard.create(), 0))
+  let checks = Test.suite("Handlers.Resilience", &[
+      Test.equals("transient statuses and failures are retried until success", &(recovered, recoveredCalls), &(Ok(200), 4)),
+      Test.equals("when retries run out the last response is answered", &(exhausted, Shared.current(&exhaustedCalls)), &(Ok(504), 4)),
+      Test.equals("a failure that is not transient is not retried", &(fatal, Shared.current(&fatalCalls)), &(Err(HttpClient.InvalidRequest("bad")), 1)),
+      Test.equals("a status that is not transient is not retried", &(notFound, Shared.current(&notFoundCalls)), &(Ok(404), 1)),
+      Test.equals("a breaker passes requests while closed", &(first, second), &(Ok(503), Ok(503))),
+      Test.that("an open breaker rejects without calling", rejected(&opened) && Shared.current(&breakerCalls) == 2),
+      Test.equals("an attempt past its timeout times out", &attemptTimeout, &Err(HttpClient.TimedOut(40))),
+      Test.that("a caller's deadline stays a timeout", match callerDeadline {
+          case Err(HttpClient.TimedOut(millis)) => millis >= 25 && millis < 2000
+          case _ => false
+        }),
+      Test.equals("a caller's cancellation stays a cancellation", &callerCancelled, &Err(HttpClient.Cancelled("cancelled: caller"))),
+      Test.that("a full rate limiter rejects", rejected(&limited)),
+      Test.equals("a pipeline is chosen per request", &(selectedGet, Shared.current(&getCalls), selectedPost, Shared.current(&postCalls)), &(Ok(200), 2, Ok(503), 1)),
+      Test.equals("a registry's pipeline is used", &(fromRegistry, Shared.current(&registryCalls)), &(Ok(200), 2)),
+      Test.that("a key the registry cannot build is rejected", rejected(&missingKey)),
+      Test.equals("strategies built on transient outcomes retry them", &(onTransient, Shared.current(&onTransientCalls)), &(Ok(200), 3)),
+      Test.equals("retry-after sets the delay of a handled response", &(handled, unhandled), &(Some(2000), None)),
+      Test.equals("the transient statuses are 408, 429, and every 5xx", &[407, 408, 429, 430, 499, 500, 599].filter(|code: Int| Resilience.isTransientStatus(code)), &[408, 429, 500, 599]),
+      Test.that("the standard pipelines build", Result.isOk(&Resilience.standard()) && Result.isOk(&Resilience.standardHedging())),
+      Test.equals("the standard hedging pipeline has four layers", &Pipeline.describe(&built(Resilience.standardHedgingWith(&Resilience.standardHedgingOptions()))).strategies.length(), &4),
+      Test.equals("resilience failures become request failures", &[Guarded.Raised(HttpClient.ResponseEnded), Guarded.TimedOut(5), Guarded.Cancelled("c"), Guarded.Crashed("x")].map(|failure: Guarded.Failure[HttpClient.Failure]| Resilience.translated(&failure)), &[HttpClient.ResponseEnded, HttpClient.TimedOut(5), HttpClient.Cancelled("c"), HttpClient.Crashed("x")]),
+      Test.that("a strategy's rejection becomes a rejection", match Resilience.translated(&Guarded.IsolatedCircuit) {
+          case HttpClient.Rejected(_) => true
+          case _ => false
+        })
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

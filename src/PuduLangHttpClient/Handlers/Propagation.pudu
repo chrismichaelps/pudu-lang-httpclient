@@ -1,0 +1,34 @@
+/** @Handlers.Propagation.Module — headers of the operation in progress copied onto outgoing requests */
+module PuduLangHttpClient.Handlers.Propagation
+
+import Std.Concurrent.Cancel as Cancel
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+
+/** @Handlers.Propagation.Source — the headers of the operation a request is sent on behalf of */
+export type Source = fn() -> Array[(Str, Str)]
+
+/// A handler copying the named headers from the source onto every request that does not already
+/// carry them.
+export fn handler(names: &Array[Str], source: Source) -> Handler.Handler {
+  renaming(&names.map(|name: Str| (name, name)), source)
+}
+
+/// A handler copying each `(incoming, outgoing)` header from the source under its outgoing name onto
+/// every request that does not already carry it; a header the source lacks is not sent.
+export fn renaming(mappings: &Array[(Str, Str)], source: Source) -> Handler.Handler {
+  let held = *mappings
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    let incoming = source()
+    var headers = request.headers
+    for (from, to) in held {
+      if !Headers.has(&headers, to) {
+        for value in Headers.values(&incoming, from) { headers = Headers.add(&headers, to, value) }
+      }
+    }
+    next(Request.Request{..request, headers: headers}, token)
+  }
+}

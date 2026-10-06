@@ -1,0 +1,19 @@
+/** @Domain.Version.Module — the protocol version a request is sent with */
+module PuduLangHttpClient.Domain.Version
+
+import Std.Http as Http
+
+/** @Domain.Version.Policy — how far the sent version may stray from the requested one */
+export type Policy = OrLower | Exact | OrHigher
+
+/// The version the transport sends for a requested version under a policy, or `None` when the
+/// policy rules out every version the transport speaks: HTTP/1.0 and HTTP/1.1.
+export fn negotiate(requested: &Http.Version, policy: &Policy) -> Option[Http.Version] {
+  match (*requested, *policy) {
+    case (Http.Http10, OrHigher) => Some(Http.Http11)
+    case (Http.Http10, _) => Some(Http.Http10)
+    case (Http.Http11, _) => Some(Http.Http11)
+    case (_, OrLower) => Some(Http.Http11)
+    case _ => None
+  }
+}

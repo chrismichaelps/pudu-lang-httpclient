@@ -1,0 +1,66 @@
+/** @HttpClient.Stub.Module — a primary handler answering from rules, for tests */
+module PuduLangHttpClient.Stub
+
+import Std.Bytes as ByteSeq
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Utils.Shared as Shared
+
+/** @HttpClient.Stub.Rule — which requests a rule answers, and how */
+export type Rule = { matches: fn(Request.Request) -> Bool, answer: fn(Request.Request) -> HttpClient.Outcome[Response.Response] }
+
+/** @HttpClient.Stub.Stub — the rules, tried in the order added, and every request received */
+export type Stub = { rules: Shared.Shared[Array[Rule]], received: Shared.Shared[Array[Request.Request]] }
+
+/// A stub with no rules: every request is answered `404`.
+export fn create() -> Stub { Stub{rules: Shared.shared([]), received: Shared.shared([])} }
+
+/// Adds a rule answering the requests `matches` holds for.
+export fn when(stub: &Stub, matches: fn(Request.Request) -> Bool, answer: fn(Request.Request) -> HttpClient.Outcome[Response.Response]) -> () {
+  Shared.update(&stub.rules, |rules: Array[Rule]| rules.push(Rule{matches: matches, answer: answer}))
+}
+
+/// Adds a rule answering requests with the method whose address has the path.
+export fn on(stub: &Stub, method: Http.Method, path: Str, answer: fn(Request.Request) -> HttpClient.Outcome[Response.Response]) -> () {
+  when(stub, |request: Request.Request| request.method == method && Uri.split(request.uri).path == path, answer)
+}
+
+/// Adds a rule answering requests with the method and path with a status and a plain text body.
+export fn respond(stub: &Stub, method: Http.Method, path: Str, code: Int, body: Str) -> () {
+  on(stub, method, path, |request: Request.Request| Ok(Response.answer(&request, code).withText(body)))
+}
+
+/// The stub as the primary handler of a pipeline; a request's receiver gets the body it is answered.
+export fn send(stub: &Stub) -> Handler.Send {
+  let held = *stub
+  fn(request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] {
+    if let Err(why) = Cancel.check(&token) { return Err(HttpClient.Cancelled(Cancel.explain(&why))) }
+    Shared.update(&held.received, |held: Array[Request.Request]| held.push(request))
+    for rule in Shared.current(&held.rules) {
+      if (rule.matches)(request) { return delivered((rule.answer)(request)) }
+    }
+    Ok(Response.answer(&request, 404))
+  }
+}
+
+/// Every request received so far, in order.
+export fn received(stub: &Stub) -> Array[Request.Request] { Shared.current(&stub.received) }
+
+/// The outcome, with a successful body handed to the request's receiver, when it has one, instead
+/// of being kept.
+fn delivered(outcome: HttpClient.Outcome[Response.Response]) -> HttpClient.Outcome[Response.Response] {
+  let response = outcome ?
+  match response.request.receiver {
+    case Some(take) => {
+      let _taken = take(response.content.payload)
+      Ok(Response.Response{..response, content: Content.Content{..response.content, payload: ByteSeq.empty()}})
+    }
+    case None => Ok(response)
+  }
+}

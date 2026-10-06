@@ -1,0 +1,104 @@
+/** @Test.Support.Loopback.Module — servers on the loopback interface that suites talk to */
+module Support.Loopback
+
+import Std.Bytes as ByteSeq
+import Std.Concurrent as Concurrent
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Net as Net
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Text as Text
+
+/** @Test.Support.Loopback.Routed — a running server and the address it answers on */
+export type Routed = { running: Server.Running, base: Str }
+
+/** @Test.Support.Loopback.Scripted — a raw server answering connections from a script */
+export type Scripted = { listener: Net.Listener, base: Str, accepted: Sync.Counter }
+
+/// A server routing requests, running on its own thread until `stop`.
+export fn serve(routes: &Array[Route.Route]) -> Routed {
+  let server = Server.server(&Route.routing(routes))
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic("loopback server did not start: " + show(problem))
+  }
+  let _served = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  Routed{running: running, base: "http://127.0.0.1:" + show(Server.portOf(&running))}
+}
+
+/// Stops a routed server.
+export fn stop(routed: &Routed) -> () { let _stopped = Server.stop(&routed.running) }
+
+/// A raw server that answers each accepted connection with `script`, given the connection and its
+/// number from 1; it accepts until `close`.
+export fn scripted(script: fn(Net.Connection, Int) -> ()) -> Scripted {
+  let listener = match Net.listenLocal(0) {
+    case Ok(found) => found
+    case Err(problem) => panic("loopback listener did not start: " + show(problem))
+  }
+  let port = Result.unwrapOr(Net.portOf(&listener), 0)
+  let accepted = Sync.counter(0)
+  let made = Scripted{listener: listener, base: "http://127.0.0.1:" + show(port), accepted: accepted}
+  let _accepting = Concurrent.start(fn() -> () {
+      var going = true
+      while going {
+        match Net.accept(&listener) {
+          case Ok(connection) => {
+            let number = Result.unwrapOr(Sync.increment(&accepted, 1), 0)
+            let _handled = Concurrent.start(fn() -> () { script(connection, number) })
+          }
+          case Err(_) => { going = false }
+        }
+      }
+    })
+  made
+}
+
+/// How many connections a raw server accepted.
+export fn connections(server: &Scripted) -> Int { Result.unwrapOr(Sync.count(&server.accepted), 0) }
+
+/// Stops a raw server accepting.
+export fn close(server: &Scripted) -> () { let _closed = Net.closeListener(&server.listener) }
+
+/// Reads one request head and its body, as text; empty text once the client closed.
+export fn readRequest(connection: &Net.Connection) -> Str {
+  var pending = ByteSeq.empty()
+  loop {
+    let end = pending.indexOf("\r\n\r\n".toBytes())
+    if end >= 0 {
+      let head = Result.unwrapOr(ByteSeq.toText(&pending.take(end + 4)), "")
+      let length = lengthOf(head)
+      while pending.length() < end + 4 + length {
+        match Net.receiveWithin(connection, 65536, 5000) {
+          case Ok(Some(piece)) => { pending = pending.concat(piece) }
+          case _ => { return Result.unwrapOr(ByteSeq.toText(&pending), "") }
+        }
+      }
+      return Result.unwrapOr(ByteSeq.toText(&pending.take(end + 4 + length)), "")
+    }
+    match Net.receiveWithin(connection, 65536, 5000) {
+      case Ok(Some(piece)) => { pending = pending.concat(piece) }
+      case _ => { return Result.unwrapOr(ByteSeq.toText(&pending), "") }
+    }
+  }
+}
+
+/// Writes raw text to the connection.
+export fn write(connection: &Net.Connection, text: Str) -> () { let _sent = Net.sendText(connection, text) }
+
+/// Closes a connection from the server's side.
+export fn hangUp(connection: &Net.Connection) -> () { let _closed = Net.close(connection) }
+
+/// The body length a request head states.
+fn lengthOf(head: Str) -> Int {
+  for line in head.split("\r\n") {
+    if line.toLower().startsWith("content-length:") {
+      return match Text.stripPrefix(line.toLower(), "content-length:").trim().toInt() {
+        case Some(found) => found
+        case None => 0
+      }
+    }
+  }
+  0
+}

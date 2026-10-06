@@ -1,0 +1,182 @@
+/** @Handlers.Resilience.Module — requests sent through resilience pipelines tuned for HTTP */
+module PuduLangHttpClient.Handlers.Resilience
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Time as Time
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangResilience.CircuitBreaker as CircuitBreaker
+import PuduLangResilience.Context as Guard
+import PuduLangResilience as Guarded
+import PuduLangResilience.Hedging as Hedging
+import PuduLangResilience.Pipeline as Pipeline
+import PuduLangResilience.Predicate as Predicate
+import PuduLangResilience.RateLimiter as RateLimiter
+import PuduLangResilience.Registry as Registry
+import PuduLangResilience.Retry as Retry
+import PuduLangResilience.Strategy as Strategy
+import PuduLangResilience.Timeout as Timeout
+
+/** @Handlers.Resilience.Guarding — a resilience pipeline over HTTP responses and failures */
+export type Guarding = Pipeline.Pipeline[Response.Response, HttpClient.Failure]
+
+/** @Handlers.Resilience.Standard — the five layers of the standard pipeline, outermost first */
+export type Standard = {
+  rateLimiter: RateLimiter.Options,
+  totalRequestTimeout: Timeout.Options,
+  retry: Retry.Options[Response.Response, HttpClient.Failure],
+  circuitBreaker: CircuitBreaker.Options[Response.Response, HttpClient.Failure],
+  attemptTimeout: Timeout.Options
+}
+
+/** @Handlers.Resilience.StandardHedging — the four layers of the standard hedging pipeline */
+export type StandardHedging = {
+  totalRequestTimeout: Timeout.Options,
+  hedging: Hedging.Options[Response.Response, HttpClient.Failure],
+  circuitBreaker: CircuitBreaker.Options[Response.Response, HttpClient.Failure],
+  attemptTimeout: Timeout.Options
+}
+
+/// The statuses worth another attempt besides every 5xx: request timeout and too many requests.
+const TRANSIENT_STATUSES: Set[Int] = #{408, 429}
+
+/// A handler running the rest of the pipeline under a resilience pipeline: each attempt observes
+/// the strategies' token, and a strategy's rejection is answered as `Rejected`.
+export fn handler(pipeline: Guarding) -> Handler.Handler { selecting(|_request: Request.Request| pipeline) }
+
+/// A handler choosing the resilience pipeline for each request, such as one for reads and another
+/// for writes.
+export fn selecting(choose: fn(Request.Request) -> Guarding) -> Handler.Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    guarded(&choose(request), request, &token, next)
+  }
+}
+
+/// A handler running each request under the registry's pipeline for `key`, built on first use and
+/// rebuilt when the registry reloads it; a key the registry cannot build is `Rejected`.
+export fn fromRegistry(registry: &Registry.Registry[Response.Response, HttpClient.Failure], key: Str) -> Handler.Handler {
+  let held = *registry
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    match Registry.get(&held, key) {
+      case Ok(pipeline) => guarded(&pipeline, request, &token, next)
+      case Err(problem) => Err(HttpClient.Rejected(Registry.explain(&problem)))
+    }
+  }
+}
+
+/// The standard layers: a concurrency limiter of 1000 permits, a 30-second total timeout, three
+/// exponential retries from two seconds with jitter honouring `retry-after`, a circuit breaker
+/// opening at a tenth of at least 100 requests failing in 30 seconds for 5 seconds, and a 10-second
+/// timeout per attempt; the retry and the breaker handle transient outcomes.
+export fn standardOptions() -> Standard {
+  Standard {
+    rateLimiter: RateLimiter.concurrency(1000, 0),
+    totalRequestTimeout: Timeout.after(30000),
+    retry: Retry.Options{..Retry.defaults(), shouldHandle: transient(), backoff: Retry.Exponential, useJitter: true, delayGenerator: Some(retryAfter)},
+    circuitBreaker: CircuitBreaker.Options{..CircuitBreaker.defaults(), shouldHandle: transient()},
+    attemptTimeout: Timeout.after(10000)
+  }
+}
+
+/// The standard pipeline.
+export fn standard() -> Result[Guarding, Pipeline.Invalid] { standardWith(&standardOptions()) }
+
+/// The standard pipeline with its layers as given.
+export fn standardWith(options: &Standard) -> Result[Guarding, Pipeline.Invalid] {
+  Pipeline.build([
+      RateLimiter.strategy(options.rateLimiter),
+      Timeout.strategy(options.totalRequestTimeout),
+      Retry.strategy(options.retry),
+      CircuitBreaker.strategy(options.circuitBreaker),
+      Timeout.strategy(options.attemptTimeout)
+    ])
+}
+
+/// The standard hedging layers: a 30-second total timeout, one hedged attempt after two seconds for
+/// transient outcomes, a circuit breaker for transient outcomes, and a 10-second timeout per attempt.
+export fn standardHedgingOptions() -> StandardHedging {
+  StandardHedging {
+    totalRequestTimeout: Timeout.after(30000),
+    hedging: Hedging.Options{..Hedging.defaults(), shouldHandle: transient()},
+    circuitBreaker: CircuitBreaker.Options{..CircuitBreaker.defaults(), shouldHandle: transient()},
+    attemptTimeout: Timeout.after(10000)
+  }
+}
+
+/// The standard hedging pipeline.
+export fn standardHedging() -> Result[Guarding, Pipeline.Invalid] { standardHedgingWith(&standardHedgingOptions()) }
+
+/// The standard hedging pipeline with its layers as given.
+export fn standardHedgingWith(options: &StandardHedging) -> Result[Guarding, Pipeline.Invalid] {
+  Pipeline.build([
+      Timeout.strategy(options.totalRequestTimeout),
+      Hedging.strategy(options.hedging),
+      CircuitBreaker.strategy(options.circuitBreaker),
+      Timeout.strategy(options.attemptTimeout)
+    ])
+}
+
+/// A pipeline of the strategies `build` makes when given the transient predicate, so each strategy
+/// handles exactly the outcomes worth another attempt.
+export fn onTransient(build: fn(Predicate.Predicate[Response.Response, HttpClient.Failure]) -> Array[Strategy.Strategy[Response.Response, HttpClient.Failure]]) -> Result[Guarding, Pipeline.Invalid] {
+  Pipeline.build(build(transient()))
+}
+
+/// Outcomes worth another attempt: a 5xx, 408, or 429 response, a transient failure, and a timeout.
+export fn transient() -> Predicate.Predicate[Response.Response, HttpClient.Failure] {
+  Predicate.anyOf(&[
+      Predicate.results(|response: Response.Response| isTransientStatus(response.status.code)),
+      Predicate.raised(|failure: HttpClient.Failure| HttpClient.isTransient(&failure)),
+      Predicate.timeouts()
+    ])
+}
+
+/// Whether a status is worth another attempt.
+export fn isTransientStatus(code: Int) -> Bool { code >= 500 || code in TRANSIENT_STATUSES }
+
+/// The wait a handled response's `retry-after` header asks for, or `None` to keep the backoff.
+export fn retryAfter(given: Predicate.Arguments[Response.Response, HttpClient.Failure]) -> Option[Int] {
+  match given.outcome {
+    case Ok(response) => Response.retryAfter(&response, Time.toMillis(&Time.currentInstant()))
+    case Err(_) => None
+  }
+}
+
+/// A resilience failure as a request failure: the request's own failure unchanged, a timeout or
+/// cancellation as one, and a strategy's rejection as `Rejected`.
+export fn translated(failure: &Guarded.Failure[HttpClient.Failure]) -> HttpClient.Failure {
+  match failure {
+    case Guarded.Raised(inner) => inner
+    case Guarded.TimedOut(millis) => HttpClient.TimedOut(millis)
+    case Guarded.Cancelled(reason) => HttpClient.Cancelled(reason)
+    case Guarded.Crashed(reason) => HttpClient.Crashed(reason)
+    case rejection => HttpClient.Rejected(Guarded.describe(&rejection))
+  }
+}
+
+/// The response the rest of the pipeline answers under the resilience pipeline. An attempt stopped
+/// by its own token answers a cancellation so the strategy that fired it can tell; a deadline of the
+/// caller's that passed stays a timeout.
+fn guarded(pipeline: &Guarding, request: Request.Request, token: &Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+  let began = clock()
+  let outcome = Pipeline.executeWith(pipeline, Guard.cancellable(*token), fn(attempt: Guard.Context) -> Guarded.Outcome[Response.Response, HttpClient.Failure] {
+      match next(request, attempt.token) {
+        case Ok(response) => Ok(response)
+        case Err(failure) => {
+          match Cancel.reason(&attempt.token) {
+            case Some(why) => if HttpClient.isTimeout(&failure) || HttpClient.isCancellation(&failure) { Err(Guarded.Cancelled(Cancel.explain(&why))) } else { Err(Guarded.Raised(failure)) }
+            case None => Err(Guarded.Raised(failure))
+          }
+        }
+      }
+    })
+  match outcome {
+    case Ok(response) => Ok(response)
+    case Err(Guarded.Cancelled(reason)) => {
+      if Cancel.reason(token) == Some(Cancel.DeadlineExceeded) { Err(HttpClient.TimedOut(clock() - began)) } else { Err(HttpClient.Cancelled(reason)) }
+    }
+    case Err(failure) => Err(translated(&failure))
+  }
+}

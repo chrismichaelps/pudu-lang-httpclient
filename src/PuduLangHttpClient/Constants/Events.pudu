@@ -1,0 +1,32 @@
+/** @Constants.Events.Module — the templates of every structured log event */
+module PuduLangHttpClient.Constants.Events
+
+/// The outer event of a request entering a client's pipeline; its properties are the method and address.
+export const PIPELINE_STARTED: Str = "Start processing HTTP request \{Method\} \{Uri\}"
+
+/// The outer event of a request leaving a client's pipeline; its properties are the elapsed milliseconds and status.
+export const PIPELINE_ENDED: Str = "End processing HTTP request after \{Elapsed\} ms - \{StatusCode\}"
+
+/// The inner event of a request handed to the primary handler; its properties are the method and address.
+export const REQUEST_SENDING: Str = "Sending HTTP request \{Method\} \{Uri\}"
+
+/// The inner event of a response coming back from the primary handler; its properties are the elapsed milliseconds and status.
+export const RESPONSE_RECEIVED: Str = "Received HTTP response headers after \{Elapsed\} ms - \{StatusCode\}"
+
+/// The event of a request failing; its properties are the method, address, elapsed milliseconds, and failure.
+export const REQUEST_FAILED: Str = "HTTP request \{Method\} \{Uri\} failed after \{Elapsed\} ms: \{Failure\}"
+
+/// The verbose event listing a request's headers, redacted; its property is the headers.
+export const REQUEST_HEADERS: Str = "Request headers: \{Headers\}"
+
+/// The verbose event listing a response's headers, redacted; its property is the headers.
+export const RESPONSE_HEADERS: Str = "Response headers: \{Headers\}"
+
+/// The source suffix of the events around a whole pipeline.
+export const LOGICAL_HANDLER: Str = "LogicalHandler"
+
+/// The source suffix of the events around the primary handler.
+export const CLIENT_HANDLER: Str = "ClientHandler"
+
+/// The source prefix every event's source starts with.
+export const SOURCE_ROOT: Str = "PuduLangHttpClient"

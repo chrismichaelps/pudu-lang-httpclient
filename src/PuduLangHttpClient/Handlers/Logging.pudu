@@ -1,0 +1,68 @@
+/** @Handlers.Logging.Module — structured events around a pipeline and around its primary handler */
+module PuduLangHttpClient.Handlers.Logging
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import PuduLangHttpClient.Constants.Events as Events
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangLog as Log
+import PuduLangLog.Logger as Logger
+import PuduLangLog.Value as Value
+
+/** @Handlers.Logging.Templates — the templates one handler writes */
+type Templates = { started: Str, ended: Str }
+
+/// An observer writing to the logger: information events where a request enters and leaves the
+/// pipeline under `PuduLangHttpClient.<name>.LogicalHandler`, the same where it reaches the primary
+/// handler under `PuduLangHttpClient.<name>.ClientHandler`, a warning when it fails, and verbose
+/// events listing redacted headers.
+export fn observer(logger: Logger.Logger) -> Builder.Observer {
+  Builder.Observer {
+    outer: |seen: Builder.Observation| handler(logger.forSource(sourceOf(seen.name, Events.LOGICAL_HANDLER)), seen.redact, Templates{started: Events.PIPELINE_STARTED, ended: Events.PIPELINE_ENDED}),
+    inner: |seen: Builder.Observation| handler(logger.forSource(sourceOf(seen.name, Events.CLIENT_HANDLER)), seen.redact, Templates{started: Events.REQUEST_SENDING, ended: Events.RESPONSE_RECEIVED})
+  }
+}
+
+/// The source of a client's events.
+export fn sourceOf(name: Str, layer: Str) -> Str {
+  if name.isEmpty() { Events.SOURCE_ROOT + "." + layer } else { Events.SOURCE_ROOT + "." + name + "." + layer }
+}
+
+/// The handler writing one pair of events around the rest of the pipeline.
+fn handler(logger: Logger.Logger, redact: fn(Str) -> Bool, templates: Templates) -> Handler.Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    let method = Value.text(Http.methodName(&request.method))
+    let uri = Value.text(request.uri)
+    logger.information(templates.started, [method, uri])
+    if logger.isEnabled(Log.Verbose) { logger.verbose(Events.REQUEST_HEADERS, [Value.text(rendered(&Headers.merged(&request.headers, &contentHeaders(&request)), redact))]) }
+    let began = clock()
+    let outcome = next(request, token)
+    let took = Value.int(clock() - began)
+    match outcome {
+      case Ok(response) => {
+        logger.information(templates.ended, [took, Value.int(response.status.code)])
+        if logger.isEnabled(Log.Verbose) { logger.verbose(Events.RESPONSE_HEADERS, [Value.text(rendered(&response.headers.concat(response.content.headers), redact))]) }
+      }
+      case Err(failure) => logger.warning(Events.REQUEST_FAILED, [method, uri, took, Value.text(HttpClient.describe(&failure))])
+    }
+    outcome
+  }
+}
+
+/// The headers of the request's body.
+fn contentHeaders(request: &Request.Request) -> Array[(Str, Str)] {
+  match request.content {
+    case Some(content) => content.headers
+    case None => []
+  }
+}
+
+/// The headers as one line, with redacted values hidden.
+fn rendered(headers: &Array[(Str, Str)], redact: fn(Str) -> Bool) -> Str {
+  Headers.redacted(headers, redact).map(|pair: (Str, Str)| pair[0] + ": " + pair[1]).join(", ")
+}

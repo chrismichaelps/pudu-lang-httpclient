@@ -1,0 +1,157 @@
+/** @Test.Transport.Exchange.Suite — response framing read from scripted raw connections */
+module PuduLangHttpClient.Transport.ExchangeTest
+
+import Std.Bytes as ByteSeq
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Io as Io
+import Std.Net as Net
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Test as Test
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport as Transport
+import Support.Loopback as Loopback
+
+/// A raw server answering every request on every connection with the same text, keeping the
+/// connection open for the next request.
+fn answering(reply: Str) -> Loopback.Scripted {
+  Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
+      var going = true
+      while going {
+        if Loopback.readRequest(&connection).isEmpty() { going = false } else { Loopback.write(&connection, reply) }
+      }
+    })
+}
+
+/// The response a transport gets for a `GET` of the server's root within two seconds.
+fn fetched(transport: &Transport.Transport, server: &Loopback.Scripted) -> HttpClient.Outcome[Response.Response] {
+  Transport.send(transport)(Request.get(server.base + "/"), Cancel.expiring(2000))
+}
+
+/// The status, body, and trailers of an outcome.
+fn shape(outcome: &HttpClient.Outcome[Response.Response]) -> Result[(Int, Str, Array[(Str, Str)]), HttpClient.Failure] {
+  Result.map(*outcome, |response: Response.Response| (response.status.code, Result.unwrapOr(Response.text(&response), ""), response.trailers))
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let chunkedServer = answering("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nx-sum: 11\r\n\r\n")
+  let chunkedTransport = Transport.create(Transport.defaults())
+  let chunked = shape(&fetched(&chunkedTransport, &chunkedServer))
+  let chunkedAgain = shape(&fetched(&chunkedTransport, &chunkedServer))
+  let chunkedStats = Transport.statistics(&chunkedTransport)
+  let tooBigChunks = fetched(&Transport.create(Transport.defaults().withMaxResponseContentLength(4)), &chunkedServer)
+
+  let interim = answering("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+  let continued = shape(&fetched(&Transport.create(Transport.defaults()), &interim))
+
+  let closing = Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
+      let _read = Loopback.readRequest(&connection)
+      Loopback.write(&connection, "HTTP/1.0 200 OK\r\n\r\nuntil the end")
+      Loopback.hangUp(&connection)
+    })
+  let closingTransport = Transport.create(Transport.defaults())
+  let untilClose = shape(&fetched(&closingTransport, &closing))
+  let closeStats = Transport.statistics(&closingTransport)
+
+  let staleServer = Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
+      let _read = Loopback.readRequest(&connection)
+      Loopback.write(&connection, "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nfresh")
+      Loopback.hangUp(&connection)
+    })
+  let staleTransport = Transport.create(Transport.defaults())
+  let beforeStale = shape(&fetched(&staleTransport, &staleServer))
+  let afterStale = shape(&fetched(&staleTransport, &staleServer))
+
+  let streamedServer = answering("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nhello world")
+  let pieces = Sync.cell(ByteSeq.empty())
+  let streamed = Transport.send(&Transport.create(Transport.defaults()))(Request.get(streamedServer.base + "/").withReceiver(fn(piece: Bytes) -> Bool {
+        let held = Result.unwrapOr(Sync.get(&pieces), ByteSeq.empty())
+        let _kept = Sync.set(&pieces, held.concat(piece))
+        true
+      }), Cancel.expiring(2000))
+  let stoppedTransport = Transport.create(Transport.defaults())
+  let stopped = Transport.send(&stoppedTransport)(Request.get(chunkedServer.base + "/").withReceiver(|_piece: Bytes| false), Cancel.expiring(2000))
+
+  let garbage = fetched(&Transport.create(Transport.defaults()), &answering("NOT HTTP\r\n\r\n"))
+  let badChunk = fetched(&Transport.create(Transport.defaults()), &answering("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nzz\r\n"))
+  let cut = Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
+      let _read = Loopback.readRequest(&connection)
+      Loopback.write(&connection, "HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort")
+      Loopback.hangUp(&connection)
+    })
+  let ended = fetched(&Transport.create(Transport.defaults()), &cut)
+  let silent = Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
+      let _read = Loopback.readRequest(&connection)
+      let _held = Loopback.readRequest(&connection)
+    })
+  let unanswered = Transport.send(&Transport.create(Transport.defaults()))(Request.get(silent.base + "/"), Cancel.expiring(100))
+  let headOnly = Transport.send(&Transport.create(Transport.defaults()))(Request.head(streamedServer.base + "/"), Cancel.expiring(2000))
+
+  let uploadServer = Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
+      var received = ""
+      var going = true
+      while going && !received.contains("\r\n0\r\n\r\n") {
+        match Net.receiveWithin(&connection, 65536, 2000) {
+          case Ok(Some(piece)) => { received = received + Result.unwrapOr(ByteSeq.toText(&piece), "") }
+          case _ => { going = false }
+        }
+      }
+      let status = if received.startsWith("POST /moved") { "307 Temporary Redirect\r\nlocation: /elsewhere" } else { "200 OK" }
+      let body = received.split("\r\n\r\n").slice(1, 9).join("\r\n\r\n")
+      Loopback.write(&connection, "HTTP/1.1 " + status + "\r\ncontent-length: " + show(body.toBytes().length()) + "\r\nx-chunked: " + show(received.toLower().contains("transfer-encoding: chunked")) + "\r\n\r\n" + body)
+      Loopback.hangUp(&connection)
+    })
+  let pieces2 = Sync.cell(["ab", "", "cde"])
+  let producer = fn() -> Option[Bytes] {
+    match Result.unwrapOr(Sync.get(&pieces2), []) {
+      case [first, ..rest] => {
+        let _kept = Sync.set(&pieces2, rest)
+        Some(first.toBytes())
+      }
+      case _ => None
+    }
+  }
+  let uploaded = Transport.send(&Transport.create(Transport.defaults()))(Request.post(uploadServer.base + "/up", Content.streamed("text/plain", producer)), Cancel.expiring(2000))
+  let movedUpload = Transport.send(&Transport.create(Transport.defaults()))(Request.post(uploadServer.base + "/moved", Content.streamed("text/plain", || None)), Cancel.expiring(2000))
+  Loopback.close(&uploadServer)
+  for server in [chunkedServer, interim, closing, staleServer, streamedServer, cut, silent] { Loopback.close(&server) }
+
+  let checks = Test.suite("Transport.Exchange", &[
+      Test.equals("a chunked body is joined and its trailers kept", &chunked, &Ok((200, "hello world", [("x-sum", "11")]))),
+      Test.equals("a chunked connection is reused", &(chunkedAgain, chunkedStats.opened, chunkedStats.reused), &(Ok((200, "hello world", [("x-sum", "11")])), 1, 1)),
+      Test.equals("a chunked body over the limit is refused", &Result.map(tooBigChunks, |r: Response.Response| r.status.code), &Err(HttpClient.ContentTooLarge(4))),
+      Test.equals("an interim response is skipped", &continued, &Ok((200, "ok", []))),
+      Test.equals("a body ending with the connection is read to its end", &untilClose, &Ok((200, "until the end", []))),
+      Test.equals("a connection that ended a body is not pooled", &(closeStats.idle, closeStats.closed), &(0, 1)),
+      Test.equals("the first request on a connection the server then closes answers", &beforeStale, &Ok((200, "fresh", []))),
+      Test.equals("a pooled connection the server closed is replaced and the request sent again", &(afterStale, Loopback.connections(&staleServer)), &(Ok((200, "fresh", [])), 2)),
+      Test.equals("a receiver gets the body and the response keeps none", &(Result.map(streamed, |r: Response.Response| Response.bytes(&r).length()), Result.unwrapOr(Sync.get(&pieces), ByteSeq.empty()).toText()), &(Ok(0), Some("hello world"))),
+      Test.equals("a receiver that stops reading closes the connection", &(Result.map(stopped, |r: Response.Response| r.status.code), Transport.statistics(&stoppedTransport).idle), &(Ok(200), 0)),
+      Test.that("a response that is not HTTP is a protocol failure", match garbage {
+          case Err(HttpClient.Protocol(_)) => true
+          case _ => false
+        }),
+      Test.that("a malformed chunk is a protocol failure", match badChunk {
+          case Err(HttpClient.Protocol(_)) => true
+          case _ => false
+        }),
+      Test.equals("a body cut short ends the response", &Result.map(ended, |r: Response.Response| r.status.code), &Err(HttpClient.ResponseEnded)),
+      Test.that("a server that never answers times out", match unanswered {
+          case Err(HttpClient.TimedOut(_)) => true
+          case _ => false
+        }),
+      Test.equals("a streamed body is sent in chunks", &Result.map(uploaded, |r: Response.Response| (Result.unwrapOr(Response.text(&r), ""), Response.header(&r, "x-chunked"))), &Ok(("2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n", Some("true")))),
+      Test.equals("a redirect that would send a streamed body again is answered as it is", &Result.map(movedUpload, |r: Response.Response| r.status.code), &Ok(307)),
+      Test.equals("a head request reads no body", &Result.map(headOnly, |r: Response.Response| (r.status.code, r.request.method, Response.bytes(&r).length())), &Ok((200, Http.Head, 0)))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

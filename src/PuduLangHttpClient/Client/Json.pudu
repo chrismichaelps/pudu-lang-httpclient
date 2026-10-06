@@ -1,0 +1,56 @@
+/** @Client.Json.Module — requests and responses whose bodies are JSON */
+module PuduLangHttpClient.Client.Json
+
+import Std.Http as Http
+import Std.Json as Json
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+
+/// The media type JSON requests ask for.
+const ACCEPT_JSON: Str = "application/json"
+
+/// The body of a successful `GET` as a JSON document.
+export fn getJson(client: &Client.Client, uri: Str) -> HttpClient.Outcome[Json.Json] {
+  let response = Response.ensureSuccess(Client.send(client, accepting(client, Http.Get, uri)) ?) ?
+  Response.json(&response)
+}
+
+/// The body of a successful `GET` as a value that reads itself from JSON.
+export fn getFromJson[T: Json.Decode](client: &Client.Client, uri: Str) -> HttpClient.Outcome[T] {
+  let response = Response.ensureSuccess(Client.send(client, accepting(client, Http.Get, uri)) ?) ?
+  Response.readAs(&response)
+}
+
+/// The body of a successful `DELETE` as a value that reads itself from JSON.
+export fn deleteFromJson[T: Json.Decode](client: &Client.Client, uri: Str) -> HttpClient.Outcome[T] {
+  let response = Response.ensureSuccess(Client.send(client, accepting(client, Http.Delete, uri)) ?) ?
+  Response.readAs(&response)
+}
+
+/// The response to a `POST` carrying a value written as JSON, whatever its status.
+export fn postAsJson[T: Json.Encode](client: &Client.Client, uri: Str, value: &T) -> HttpClient.Outcome[Response.Response] {
+  Client.send(client, carrying(client, Http.Post, uri, Content.jsonOf(value)))
+}
+
+/// The response to a `PUT` carrying a value written as JSON, whatever its status.
+export fn putAsJson[T: Json.Encode](client: &Client.Client, uri: Str, value: &T) -> HttpClient.Outcome[Response.Response] {
+  Client.send(client, carrying(client, Http.Put, uri, Content.jsonOf(value)))
+}
+
+/// The response to a `PATCH` carrying a value written as JSON, whatever its status.
+export fn patchAsJson[T: Json.Encode](client: &Client.Client, uri: Str, value: &T) -> HttpClient.Outcome[Response.Response] {
+  Client.send(client, carrying(client, Http.Patch, uri, Content.jsonOf(value)))
+}
+
+/// A request asking for JSON.
+fn accepting(client: &Client.Client, method: Http.Method, uri: Str) -> Request.Request {
+  Request.Request{..Client.build(client, method, uri), headers: [("accept", ACCEPT_JSON)]}
+}
+
+/// A request asking for JSON and carrying a body.
+fn carrying(client: &Client.Client, method: Http.Method, uri: Str, content: Content.Content) -> Request.Request {
+  Request.Request{..accepting(client, method, uri), content: Some(content)}
+}

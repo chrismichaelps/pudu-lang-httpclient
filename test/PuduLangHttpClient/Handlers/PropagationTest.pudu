@@ -1,0 +1,31 @@
+/** @Test.Handlers.Propagation.Suite — headers of the operation in progress copied onto requests */
+module PuduLangHttpClient.Handlers.PropagationTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Handlers.Propagation as Propagation
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Stub as Stub
+
+/// Runs the suite.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.respond(&stub, Http.Get, "/", 200, "")
+  let incoming = || [("X-Correlation-Id", "c-1"), ("traceparent", "00-a-b-01"), ("x-tenant", "acme"), ("x-tenant", "beta")]
+  let send = Handler.compose(&[Propagation.handler(&["x-correlation-id", "x-tenant"], incoming), Propagation.renaming(&[("traceparent", "x-parent"), ("missing", "x-missing")], incoming)], Stub.send(&stub))
+  let _plain = send(Request.get("http://a/"), Cancel.token())
+  let _own = send(Request.get("http://a/").withHeader("X-Tenant", "mine"), Cancel.token())
+  let received = Stub.received(&stub)
+  let checks = Test.suite("Handlers.Propagation", &[
+      Test.equals("named headers are copied with every value, and renamed ones under their new name", &received[0].headers, &[("x-correlation-id", "c-1"), ("x-tenant", "acme"), ("x-tenant", "beta"), ("x-parent", "00-a-b-01")]),
+      Test.equals("a header the request already carries is left alone", &received[1].headers, &[("X-Tenant", "mine"), ("x-correlation-id", "c-1"), ("x-parent", "00-a-b-01")])
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

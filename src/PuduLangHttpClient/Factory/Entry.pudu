@@ -1,0 +1,64 @@
+/** @Factory.Entry.Module — one built handler pipeline, its transport, and when it was built */
+module PuduLangHttpClient.Factory.Entry
+
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Transport as Transport
+
+/** @Factory.Entry.Entry — a pipeline built for a name, reused until its lifetime runs out */
+export type Entry = {
+  name: Str,
+  generation: Int,
+  send: Handler.Send,
+  transport: Option[Transport.Transport],
+  created: Int,
+  lifetime: Int,
+  expiredAt: Option[Int]
+}
+
+/// The pipeline the builder describes, built now: observers outermost, then the handlers in the
+/// order added and as rearranged, then the observers' inner handlers, around a new primary handler.
+export fn build(builder: &Builder.Builder, generation: Int) -> Entry {
+  let (transport, primary) = match builder.primary {
+    case Some(Builder.Custom(make)) => (None, make())
+    case Some(Builder.Pooled(options)) => pooled(transportOptions(builder, options))
+    case None => pooled(transportOptions(builder, Transport.defaults()))
+  }
+  Entry {
+    name: builder.name,
+    generation: generation,
+    send: Handler.compose(&layers(builder), primary),
+    transport: transport,
+    created: clock(),
+    lifetime: Builder.lifetimeOf(builder),
+    expiredAt: None
+  }
+}
+
+/// Every handler of the pipeline, outermost first.
+export fn layers(builder: &Builder.Builder) -> Array[Handler.Handler] {
+  let observation = Builder.Observation{name: builder.name, redact: Builder.redaction(builder)}
+  var added = builder.handlers.map(|make: fn() -> Handler.Handler| make())
+  for edit in builder.handlerEdits { added = edit(added) }
+  let outer = builder.observers.map(|observer: Builder.Observer| (observer.outer)(observation))
+  let inner = builder.observers.reverse().map(|observer: Builder.Observer| (observer.inner)(observation))
+  outer.concat(added).concat(inner)
+}
+
+/// Closes the entry's transport, when it has one.
+export fn close(entry: &Entry) -> () {
+  if let Some(transport) = entry.transport { Transport.close(&transport) }
+}
+
+/// A new transport and its sender.
+fn pooled(options: Transport.Options) -> (Option[Transport.Transport], Handler.Send) {
+  let made = Transport.create(options)
+  (Some(made), Transport.send(&made))
+}
+
+/// The transport options with the builder's edits applied in order.
+export fn transportOptions(builder: &Builder.Builder, options: Transport.Options) -> Transport.Options {
+  var edited = options
+  for edit in builder.transportEdits { edited = edit(edited) }
+  edited
+}

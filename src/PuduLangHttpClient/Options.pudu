@@ -1,0 +1,47 @@
+/** @HttpClient.Options.Module — typed values a request carries for its handlers */
+module PuduLangHttpClient.Options
+
+/** @HttpClient.Options.Options — a request's options, by name */
+export type Options = { entries: Map[Str, Str] }
+
+/** @HttpClient.Options.Key — the name of one option and how its value is written and read */
+export type Key[T] = { name: Str, encode: fn(T) -> Str, decode: fn(Str) -> Option[T] }
+
+/// No options.
+export fn empty() -> Options { Options{entries: mapOf([])} }
+
+/// A key for values written and read by the given functions.
+export fn key[T](name: Str, encode: fn(T) -> Str, decode: fn(Str) -> Option[T]) -> Key[T] {
+  Key{name: name, encode: encode, decode: decode}
+}
+
+/// A key for text values.
+export fn textKey(name: Str) -> Key[Str] { key(name, |value: Str| value, |written: Str| Some(written)) }
+
+/// A key for whole numbers.
+export fn intKey(name: Str) -> Key[Int] { key(name, |value: Int| show(value), |written: Str| written.toInt()) }
+
+/// A key for flags.
+export fn boolKey(name: Str) -> Key[Bool] {
+  key(name, |value: Bool| if value { "true" } else { "false" }, |written: Str| if written == "true" { Some(true) } else if written == "false" { Some(false) } else { None })
+}
+
+/// The options with the key's value set.
+export fn set[T](options: &Options, name: &Key[T], value: T) -> Options {
+  Options{entries: options.entries.insert(name.name, (name.encode)(value))}
+}
+
+/// The key's value, when it is set and reads back as one.
+export fn get[T](options: &Options, name: &Key[T]) -> Option[T] {
+  let written = options.entries.get(name.name) ?
+  (name.decode)(written)
+}
+
+/// Whether the key is set.
+export fn has[T](options: &Options, name: &Key[T]) -> Bool { options.entries.containsKey(name.name) }
+
+/// The options without the key.
+export fn remove[T](options: &Options, name: &Key[T]) -> Options { Options{entries: options.entries.remove(name.name)} }
+
+/// The names of every option set, in order.
+export fn names(options: &Options) -> Array[Str] { options.entries.keys() }

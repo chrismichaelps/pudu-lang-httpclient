@@ -1,0 +1,58 @@
+/** @Test.Events.Bus.Suite — events delivered to their listeners through the package's own mediator */
+module PuduLangHttpClient.Events.BusTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Io as Io
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Events.Bus as Bus
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory.Entry as Entry
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+import PuduLangHttpClient.Utils.Shared as Shared
+
+/// Runs the suite.
+fn main() -> Int {
+  let lines = Shared.shared([])
+  let note = fn(line: Str) -> () { Shared.update(&lines, |held: Array[Str]| held.push(line)) }
+  let listeners = Events.listeners()
+    .onRequestStarted(|event: Events.RequestStarted| note("started " + event.client + " " + event.method + " " + event.uri))
+    .onRequestCompleted(|event: Events.RequestCompleted| note("completed " + show(event.status)))
+    .onRequestCompleted(|_event: Events.RequestCompleted| note("completed again"))
+    .onRequestFailed(|event: Events.RequestFailed| note("failed " + event.failure))
+    .onPipelineChanged(|event: Events.PipelineChanged| note("pipeline " + event.client + " " + show(event.generation) + " " + show(event.stage)))
+  let bus = Bus.create(&listeners)
+  let stub = Stub.create()
+  Stub.respond(&stub, Http.Get, "/ok", 200, "")
+  Stub.when(&stub, |request: Request.Request| request.uri.endsWith("/down"), |_request: Request.Request| Err(HttpClient.ResponseEnded))
+  let observer = match Bus.observer(&bus) {
+    case Some(found) => found
+    case None => panic("listeners hear requests")
+  }
+  let entry = Entry.build(&Builder.named("api").observedBy(observer).withPrimary(|| Stub.send(&stub)), 1)
+  let ok = Result.map(entry.send(Request.get("http://a/ok"), Cancel.token()), |r: Response.Response| r.status.code)
+  let down = Result.map(entry.send(Request.get("http://a/down"), Cancel.token()), |r: Response.Response| r.status.code)
+  Bus.pipelineChanged(&bus, "api", 1, Events.Closed)
+  let checks = Test.suite("Events.Bus", &[
+      Test.equals("announcing leaves the outcome alone", &(ok, down), &(Ok(200), Err(HttpClient.ResponseEnded))),
+      Test.equals("every listener hears its events in order", &Shared.current(&lines), &[
+          "started api GET http://a/ok",
+          "completed 200",
+          "completed again",
+          "started api GET http://a/down",
+          "failed The connection closed before the response was complete.",
+          "pipeline api 1 Closed"
+        ]),
+      Test.equals("a bus no one listens to requests on adds no observer", &(Bus.observer(&Bus.create(&Events.listeners())) == None), &true)
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

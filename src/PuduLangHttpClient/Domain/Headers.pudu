@@ -1,0 +1,99 @@
+/** @Domain.Headers.Module — header lists compared without regard to case */
+module PuduLangHttpClient.Domain.Headers
+
+import Std.Http.Safe as Safe
+import Std.Result as Result
+
+/// The headers that describe a body rather than the message carrying it.
+const CONTENT_HEADERS: Set[Str] = #{
+  "allow",
+  "content-disposition",
+  "content-encoding",
+  "content-language",
+  "content-length",
+  "content-location",
+  "content-md5",
+  "content-range",
+  "content-type",
+  "expires",
+  "last-modified"
+}
+
+/// The value written in place of a redacted header value.
+export const REDACTED: Str = "*"
+
+/// The first value given for a header.
+export fn get(headers: &Array[(Str, Str)], name: Str) -> Option[Str] {
+  let wanted = name.toLower()
+  for pair in headers {
+    if pair[0].toLower() == wanted { return Some(pair[1]) }
+  }
+  None
+}
+
+/// Every value given for a header, in order.
+export fn values(headers: &Array[(Str, Str)], name: Str) -> Array[Str] {
+  let wanted = name.toLower()
+  headers.filter(|pair: (Str, Str)| pair[0].toLower() == wanted).map(|pair: (Str, Str)| pair[1])
+}
+
+/// Whether a header is present.
+export fn has(headers: &Array[(Str, Str)], name: Str) -> Bool {
+  let wanted = name.toLower()
+  for pair in headers {
+    if pair[0].toLower() == wanted { return true }
+  }
+  false
+}
+
+/// The headers with one value added after any the name already has.
+export fn add(headers: &Array[(Str, Str)], name: Str, value: Str) -> Array[(Str, Str)] { headers.push((name, value)) }
+
+/// The headers with every value of the name replaced by one.
+export fn set(headers: &Array[(Str, Str)], name: Str, value: Str) -> Array[(Str, Str)] { remove(headers, name).push((name, value)) }
+
+/// The headers without any value of the name.
+export fn remove(headers: &Array[(Str, Str)], name: Str) -> Array[(Str, Str)] {
+  let wanted = name.toLower()
+  headers.filter(|pair: (Str, Str)| pair[0].toLower() != wanted)
+}
+
+/// The headers without any value of the names.
+export fn removeAll(headers: &Array[(Str, Str)], names: &Set[Str]) -> Array[(Str, Str)] {
+  headers.filter(|pair: (Str, Str)| !(pair[0].toLower() in *names))
+}
+
+/// The defaults whose names the message does not already carry, followed by the message's own.
+export fn merged(defaults: &Array[(Str, Str)], own: &Array[(Str, Str)]) -> Array[(Str, Str)] {
+  defaults.filter(|pair: (Str, Str)| !has(own, pair[0])).concat(*own)
+}
+
+/// The headers with the value of every name `redact` holds for replaced by `REDACTED`.
+export fn redacted(headers: &Array[(Str, Str)], redact: fn(Str) -> Bool) -> Array[(Str, Str)] {
+  headers.map(|pair: (Str, Str)| if redact(pair[0].toLower()) { (pair[0], REDACTED) } else { pair })
+}
+
+/// Whether a header describes a body rather than the message carrying it.
+export fn isContentHeader(name: Str) -> Bool { name.toLower() in CONTENT_HEADERS }
+
+/// The headers split into the message's own and the body's.
+export fn splitContent(headers: &Array[(Str, Str)]) -> (Array[(Str, Str)], Array[(Str, Str)]) {
+  (headers.filter(|pair: (Str, Str)| !isContentHeader(pair[0])), headers.filter(|pair: (Str, Str)| isContentHeader(pair[0])))
+}
+
+/// The first header whose name or value cannot be written without breaking the message.
+export fn unwritable(headers: &Array[(Str, Str)]) -> Option[Str] {
+  for pair in headers {
+    if pair[0].isEmpty() || pair[0].contains(":") || Result.isErr(&Safe.headerWritable(pair[0], pair[1])) { return Some(pair[0]) }
+  }
+  None
+}
+
+/// Whether a comma-separated header value lists a token, compared without regard to case.
+export fn lists(value: Str, token: Str) -> Bool {
+  let wanted = token.toLower()
+  for piece in value.split(",") {
+    if piece.trim().toLower() == wanted { return true }
+  }
+  false
+}

@@ -1,0 +1,134 @@
+/** @Test.Client.Suite — a configured client sending through its pipeline */
+module PuduLangHttpClient.ClientTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Io as Io
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+import PuduLangHttpClient.Transport as Transport
+import Support.Loopback as Loopback
+
+/// A primary handler that waits for its token, as the transport does, and answers how it stopped.
+fn waiting(request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] {
+  let began = clock()
+  match Cancel.pause(&token, 5000) {
+    case Ok(_) => Ok(Response.answer(&request, 200))
+    case Err(Cancel.Requested(reason)) => Err(HttpClient.Cancelled(reason))
+    case Err(Cancel.DeadlineExceeded) => Err(HttpClient.TimedOut(clock() - began))
+  }
+}
+
+/// The status and text of an outcome.
+fn shape(outcome: &HttpClient.Outcome[Response.Response]) -> Result[(Int, Str), HttpClient.Failure] {
+  Result.map(*outcome, |response: Response.Response| (response.status.code, Result.unwrapOr(Response.text(&response), "")))
+}
+
+/// The connections opened and reused by two copies of one pooled client fetching from the server.
+fn sharedPool(server: &Loopback.Routed) -> (Int, Int) {
+  let options = Transport.defaults().withPooledConnectionLifetime(60000)
+  let transport = Transport.create(options)
+  let shared = Client.over(&transport).withBaseAddress(server.base + "/")
+  let elsewhere = shared
+  let _first = Client.getText(&shared, "hello")
+  let _second = Client.getText(&elsewhere, "hello")
+  let _built = Client.pooled(options)
+  let stats = Transport.statistics(&transport)
+  (stats.opened, stats.reused)
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let server = Loopback.serve(&[Route.get("/hello", |_request: Route.Request| Reply.text(200, "hi"))])
+  let stub = Stub.create()
+  Stub.on(&stub, Http.Get, "/v1/echo", |request: Request.Request| Ok(Response.answer(&request, 200).withText(request.uri + " " + request.headers.map(|pair: (Str, Str)| pair[0] + "=" + pair[1]).join(","))))
+  Stub.respond(&stub, Http.Get, "/v1/missing", 404, "no")
+  Stub.on(&stub, Http.Post, "/v1/echo", |request: Request.Request| Ok(Response.answer(&request, 201).withText(Result.unwrapOr(Content.readText(&match request.content { case Some(found) => found case None => Content.empty() }), ""))))
+  Stub.respond(&stub, Http.Put, "/v1/echo", 204, "")
+  Stub.respond(&stub, Http.Patch, "/v1/echo", 200, "patched")
+  Stub.respond(&stub, Http.Delete, "/v1/echo", 202, "")
+  Stub.respond(&stub, Http.Head, "/v1/echo", 200, "")
+  let client = Client.create(Stub.send(&stub)).withBaseAddress("https://api.test/v1/").withDefaultHeader("user-agent", "shop/1").withDefaultHeader("accept", "*/*").withDefaultVersion(Http.Http10, Version.OrHigher).named("shop")
+  let relative = shape(&Client.get(&client, "echo?x=1"))
+  let overridden = shape(&Client.send(&client, Request.get("echo").withHeader("Accept", "text/plain")))
+  let absolute = shape(&Client.get(&client, "https://api.test/v1/echo"))
+  let escaped = shape(&Client.get(&client, "echo?q=a b"))
+  let text = Client.getText(&client, "echo")
+  let bytes = Result.map(Client.getBytes(&client, "missing"), |found: Bytes| found.length())
+  let posted = shape(&Client.post(&client, "echo", Content.plain("body")))
+  let others = [Client.put(&client, "echo", Content.empty()), Client.patch(&client, "echo", Content.plain("p")), Client.delete(&client, "echo"), Client.head(&client, "echo")].map(|outcome: HttpClient.Outcome[Response.Response]| Result.map(outcome, |r: Response.Response| r.status.code))
+  let pieces = Sync.cell("")
+  let streamed = Client.stream(&client, "echo", fn(piece: Bytes) -> Bool {
+      let _kept = Sync.set(&pieces, Result.unwrapOr(Sync.get(&pieces), "") + match piece.toText() { case Some(found) => found case None => "" })
+      true
+    })
+  let built = Client.build(&client, Http.Get, "x")
+  let noBase = Client.get(&Client.create(Stub.send(&stub)), "echo")
+  let limited = Stub.received(&stub)
+  let bufferLimit = Request.option(&limited[0], &Transport.bufferLimit())
+
+  let slow = Client.create(waiting).withTimeout(30)
+  let timedOut = shape(&Client.get(&slow, "http://a/"))
+  let callerToken = Cancel.token()
+  let _cancelled = Cancel.cancel(&callerToken, "caller")
+  let callerCancelled = shape(&Client.sendWith(&slow, Request.get("http://a/"), callerToken))
+  let callerDeadline = shape(&Client.sendWith(&Client.create(waiting).withTimeout(Defaults.INFINITE), Request.get("http://a/"), Cancel.expiring(20)))
+  let pending = Client.create(waiting)
+  let outcome = Sync.cell(Ok((0, "")))
+  let started = match Concurrent.start(fn() -> () { let _set = Sync.set(&outcome, shape(&Client.get(&pending, "http://a/"))) }) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let _paused = Concurrent.sleep(30)
+  Client.cancelPending(&pending)
+  let _joined = Concurrent.join(&started)
+  let afterCancel = Client.sendWith(&pending, Request.get("http://a/"), Cancel.expiring(20))
+
+  let checks = Test.suite("Client", &[
+      Test.equals("a relative address resolves against the base address and gets the default headers", &relative, &Ok((200, "https://api.test/v1/echo?x=1 user-agent=shop/1,accept=*/*"))),
+      Test.equals("a request's own header wins over a default", &overridden, &Ok((200, "https://api.test/v1/echo user-agent=shop/1,Accept=text/plain"))),
+      Test.equals("an absolute address is sent as given", &absolute, &Ok((200, "https://api.test/v1/echo user-agent=shop/1,accept=*/*"))),
+      Test.equals("characters an address cannot carry are escaped", &escaped, &Ok((200, "https://api.test/v1/echo?q=a%20b user-agent=shop/1,accept=*/*"))),
+      Test.equals("get text answers the body of a success", &text, &Ok("https://api.test/v1/echo user-agent=shop/1,accept=*/*")),
+      Test.equals("get bytes refuses a failed status", &bytes, &Err(HttpClient.Unsuccessful(404, "Not Found"))),
+      Test.equals("a post carries its body", &posted, &Ok((201, "body"))),
+      Test.equals("put, patch, delete, and head use their methods", &others, &[Ok(204), Ok(200), Ok(202), Ok(200)]),
+      Test.equals("a stream hands the body to the receiver", &(shape(&streamed), Result.unwrapOr(Sync.get(&pieces), "")), &(Ok((200, "")), "https://api.test/v1/echo user-agent=shop/1,accept=*/*")),
+      Test.equals("helpers send with the client's default version", &(built.version, built.versionPolicy), &(Http.Http10, Version.OrHigher)),
+      Test.equals("a relative address without a base address is refused", &Result.map(noBase, |r: Response.Response| r.status.code), &Err(HttpClient.InvalidRequest("'echo' is relative and the client has no base address"))),
+      Test.equals("every request carries the client's buffer limit", &bufferLimit, &Some(Defaults.MAX_RESPONSE_BUFFER)),
+      Test.equals("the client's timeout is reported as its own", &timedOut, &Err(HttpClient.TimedOut(30))),
+      Test.equals("a caller's cancellation is reported as one", &callerCancelled, &Err(HttpClient.Cancelled("caller"))),
+      Test.that("a caller's deadline is reported as the time spent", match callerDeadline {
+          case Err(HttpClient.TimedOut(millis)) => millis >= 15 && millis < 1000
+          case _ => false
+        }),
+      Test.equals("cancelling pending requests stops the one in flight", &Result.unwrapOr(Sync.get(&outcome), Ok((0, ""))), &Err(HttpClient.Cancelled("the client cancelled its pending requests"))),
+      Test.that("a request after cancelling pending ones is not cancelled", match afterCancel {
+          case Err(HttpClient.TimedOut(_)) => true
+          case _ => false
+        }),
+      Test.equals("the defaults are valid", &Client.validate(&client), &[]),
+      Test.equals("every invalid setting is reported", &Client.validate(&Client.create(waiting).withBaseAddress("api.test").withTimeout(0).withMaxResponseContentBufferSize(-1).withDefaultHeader("x", "a\nb")), &["baseAddress must be an absolute http or https address: api.test", "timeout must be positive or INFINITE", "maxResponseContentBufferSize must be at least 0", "the header 'x' contains a line break or an invalid name"]),
+      Test.equals("a pooled client's copies share one pool", &sharedPool(&server), &(1, 1)),
+      Test.equals("a client over a transport has the default name", &Client.over(&Transport.create(Transport.defaults())).name, &"")
+    ])
+  Loopback.stop(&server)
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

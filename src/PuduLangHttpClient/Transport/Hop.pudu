@@ -1,0 +1,78 @@
+/** @Transport.Hop.Module — one request sent over a pooled connection */
+module PuduLangHttpClient.Transport.Hop
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Result as Result
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Transport.Connect as Connect
+import PuduLangHttpClient.Transport.Exchange as Exchange
+import PuduLangHttpClient.Transport.Pool as Pool
+import PuduLangHttpClient.Transport.Wire as Wire
+
+/** @Transport.Hop.Sending — everything one hop needs besides the pool and the route */
+export type Sending = {
+  written: Bytes,
+  method: Http.Method,
+  headers: Array[(Str, Str)],
+  reading: Exchange.Reading,
+  connectTimeout: Int,
+  deadline: Option[Int],
+  receiver: Option[Request.Receiver],
+  following: Bool,
+  upload: Option[Content.Producer]
+}
+
+/// The response to one request along the route, over a pooled connection when one is idle; a
+/// reused connection that fails before any of the response arrived was closed by the server while
+/// idle, and the request is sent once more over a new connection unless its body was streamed.
+export fn send(pool: &Pool.Pool, route: &Connect.Route, sending: &Sending, token: &Cancel.Token) -> Result[Exchange.Exchanged, Wire.Fault] {
+  let first = attempt(pool, route, sending, token)
+  let outcome = match first {
+    case Err((_, true)) => attempt(pool, route, sending, token)
+    case _ => first
+  }
+  Result.mapErr(outcome, |failed: (Wire.Fault, Bool)| failed[0])
+}
+
+/// One try: the exchange, or the fault and whether a fresh connection may succeed where a reused one
+/// failed.
+fn attempt(pool: &Pool.Pool, route: &Connect.Route, sending: &Sending, token: &Cancel.Token) -> Result[Exchange.Exchanged, (Wire.Fault, Bool)] {
+  let lease = match Pool.acquire(pool, route.key, token, sending.deadline) {
+    case Ok(found) => found
+    case Err(fault) => { return Err((fault, false)) }
+  }
+  let (link, created, reused) = match lease {
+    case Pool.Reused(idle) => (idle.link, idle.created, true)
+    case Pool.Fresh => {
+      match Connect.open(route, sending.connectTimeout, sending.deadline) {
+        case Ok(opened) => (opened, clock(), false)
+        case Err(fault) => {
+          Pool.forfeit(pool, route.key)
+          return Err((fault, false))
+        }
+      }
+    }
+  }
+  match Exchange.exchange(&link, &sending.written, &sending.method, &sending.headers, &sending.reading, sending.deadline, sending.receiver, sending.following, sending.upload) {
+    case Ok(exchanged) => {
+      Pool.release(pool, route.key, link, created, exchanged.reusable)
+      Ok(exchanged)
+    }
+    case Err(trouble) => {
+      Pool.release(pool, route.key, link, created, false)
+      Err((trouble.fault, reused && !trouble.answered && sending.upload == None && stale(&trouble.fault)))
+    }
+  }
+}
+
+/// Whether a fault is what a connection the server closed while idle produces.
+fn stale(fault: &Wire.Fault) -> Bool {
+  match fault {
+    case Wire.Ended => true
+    case Wire.Broken(HttpClient.Connection(_)) => true
+    case _ => false
+  }
+}

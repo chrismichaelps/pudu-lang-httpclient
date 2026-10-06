@@ -1,0 +1,65 @@
+/** @Handlers.Metrics.Module — counts and durations of the requests through a pipeline */
+module PuduLangHttpClient.Handlers.Metrics
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Json as Json
+import Std.Math as Math
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Utils.Shared as Shared
+
+/** @Handlers.Metrics.Snapshot — what the requests measured so far add up to */
+export type Snapshot = {
+  requests: Int,
+  active: Int,
+  informational: Int,
+  successful: Int,
+  redirected: Int,
+  clientErrors: Int,
+  serverErrors: Int,
+  failed: Int,
+  totalMillis: Int,
+  longestMillis: Int
+} derives Json.Encode
+
+/** @Handlers.Metrics.Meter — a snapshot shared by every request a handler measures */
+export type Meter = { held: Shared.Shared[Snapshot] }
+
+/// A meter with nothing measured.
+export fn meter() -> Meter {
+  Meter{held: Shared.shared(Snapshot{requests: 0, active: 0, informational: 0, successful: 0, redirected: 0, clientErrors: 0, serverErrors: 0, failed: 0, totalMillis: 0, longestMillis: 0})}
+}
+
+/// A handler counting every request into the meter: started, in flight, finished by status class
+/// or failed, and how long each took.
+export fn handler(target: &Meter) -> Handler.Handler {
+  let held = *target
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    Shared.update(&held.held, |now: Snapshot| Snapshot{..now, requests: now.requests + 1, active: now.active + 1})
+    let began = clock()
+    let outcome = next(request, token)
+    let took = clock() - began
+    let code = match outcome {
+      case Ok(response) => response.status.code
+      case Err(_) => 0
+    }
+    Shared.update(&held.held, |now: Snapshot| counted(&now, code, took))
+    outcome
+  }
+}
+
+/// The measurements so far.
+export fn snapshot(source: &Meter) -> Snapshot { Shared.current(&source.held) }
+
+/// The snapshot with one finished request added: its status code, or 0 for a failure.
+fn counted(now: &Snapshot, code: Int, took: Int) -> Snapshot {
+  let timed = Snapshot{..*now, active: now.active - 1, totalMillis: now.totalMillis + took, longestMillis: Math.max(took, now.longestMillis)}
+  if code == 0 { Snapshot{..timed, failed: timed.failed + 1} }
+    else if code < 200 { Snapshot{..timed, informational: timed.informational + 1} }
+    else if code < 300 { Snapshot{..timed, successful: timed.successful + 1} }
+    else if code < 400 { Snapshot{..timed, redirected: timed.redirected + 1} }
+    else if code < 500 { Snapshot{..timed, clientErrors: timed.clientErrors + 1} }
+    else { Snapshot{..timed, serverErrors: timed.serverErrors + 1} }
+}
