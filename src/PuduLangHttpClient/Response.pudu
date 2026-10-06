@@ -1,0 +1,97 @@
+/** @HttpClient.Response.Module — what came back, and the request that produced it */
+module PuduLangHttpClient.Response
+
+import Std.Http as Http
+import Std.Json as Json
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Domain.RetryAfter as RetryAfter
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+
+/** @HttpClient.Response.Response — a status, headers, a body, trailers, and the final request */
+export type Response = {
+  status: Http.Status,
+  version: Http.Version,
+  headers: Array[(Str, Str)],
+  content: Content.Content,
+  trailers: Array[(Str, Str)],
+  request: Request.Request
+}
+
+/// An HTTP/1.1 response with a status and no headers or body, answering the request.
+export fn answer(request: &Request.Request, code: Int) -> Response {
+  Response{status: Http.status(code), version: Http.Http11, headers: [], content: Content.empty(), trailers: [], request: *request}
+}
+
+/// Whether the status is in the 2xx range.
+export fn isSuccess(response: &Response) -> Bool { Http.isSuccess(&response.status) }
+
+/// The response when its status is a success, and `Unsuccessful` with its code and reason otherwise.
+export fn ensureSuccess(response: Response) -> HttpClient.Outcome[Response] {
+  if isSuccess(&response) { Ok(response) } else { Err(HttpClient.Unsuccessful(response.status.code, response.status.reason)) }
+}
+
+/// The first value of a header, among the response's own headers and then its body's.
+export fn header(response: &Response, name: Str) -> Option[Str] {
+  match Headers.get(&response.headers, name) {
+    case Some(found) => Some(found)
+    case None => Headers.get(&response.content.headers, name)
+  }
+}
+
+/// Every value of a header, the response's own first and then its body's.
+export fn headerValues(response: &Response, name: Str) -> Array[Str] {
+  Headers.values(&response.headers, name).concat(Headers.values(&response.content.headers, name))
+}
+
+/// The body as UTF-8 text.
+export fn text(response: &Response) -> HttpClient.Outcome[Str] { Content.readText(&response.content) }
+
+/// The body's bytes.
+export fn bytes(response: &Response) -> Bytes { response.content.payload }
+
+/// The body as a JSON document.
+export fn json(response: &Response) -> HttpClient.Outcome[Json.Json] { Content.readJson(&response.content) }
+
+/// The body as a value that reads itself from JSON.
+export fn readAs[T: Json.Decode](response: &Response) -> HttpClient.Outcome[T] { Content.readAs(&response.content) }
+
+/// The wait the response's `retry-after` header asks for, in milliseconds at `now` milliseconds
+/// since the Unix epoch.
+export fn retryAfter(response: &Response, now: Int) -> Option[Int] {
+  let value = header(response, "retry-after") ?
+  RetryAfter.delay(value, now)
+}
+
+/** @HttpClient.Response.Answering — a response built one decision at a time, for stubs and tests */
+export trait Answering {
+  /// The response with a header value added after any the name has.
+  fn withHeader(self: &Self, name: Str, value: Str) -> Self
+  /// The response carrying a body.
+  fn withContent(self: &Self, content: Content.Content) -> Self
+  /// The response carrying UTF-8 plain text.
+  fn withText(self: &Self, body: Str) -> Self
+  /// The response carrying a JSON document.
+  fn withJson(self: &Self, value: &Json.Json) -> Self
+}
+
+impl Answering for Response {
+  /// The response with a header value added after any the name has.
+  fn withHeader(self: &Self, name: Str, value: Str) -> Self {
+    if Headers.isContentHeader(name) {
+      Response{..*self, content: Content.Content{..self.content, headers: Headers.add(&self.content.headers, name, value)}}
+    } else {
+      Response{..*self, headers: Headers.add(&self.headers, name, value)}
+    }
+  }
+
+  /// The response carrying a body.
+  fn withContent(self: &Self, content: Content.Content) -> Self { Response{..*self, content: content} }
+
+  /// The response carrying UTF-8 plain text.
+  fn withText(self: &Self, body: Str) -> Self { self.withContent(Content.plain(body)) }
+
+  /// The response carrying a JSON document.
+  fn withJson(self: &Self, value: &Json.Json) -> Self { self.withContent(Content.json(value)) }
+}

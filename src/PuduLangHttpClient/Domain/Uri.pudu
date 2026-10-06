@@ -1,0 +1,218 @@
+/** @Domain.Uri.Module — addresses split, resolved, and reduced to endpoints */
+module PuduLangHttpClient.Domain.Uri
+
+import Std.Char as Char
+import Std.Math as Math
+import Std.Option as Option
+import Std.Text as Text
+import PuduLangHttpClient.Constants.Defaults as Defaults
+
+/** @Domain.Uri.Parts — the five components of an address, absent ones kept apart from empty ones */
+export type Parts = { scheme: Option[Str], authority: Option[Str], path: Str, query: Option[Str], fragment: Option[Str] }
+
+/** @Domain.Uri.Endpoint — where an absolute http or https address connects */
+export type Endpoint = { scheme: Str, host: Str, port: Int, secure: Bool }
+
+/// The schemes a request may use, and whether each is secured.
+const SCHEMES: Map[Str, Bool] = mapOf([("http", false), ("https", true)])
+
+/// The hexadecimal digits a percent escape is written with.
+const HEX: Str = "0123456789ABCDEF"
+
+/// The address split into its components without decoding any of them.
+export fn split(text: Str) -> Parts {
+  let (scheme, afterScheme) = schemeOf(text)
+  let (named, afterAuthority) = if afterScheme.startsWith("//") {
+    let rest = afterScheme.drop(2)
+    let end = firstOf(rest, &["/", "?", "#"])
+    (Some(rest.slice(0, end)), rest.drop(end))
+  } else { (None, afterScheme) }
+  let fragmentAt = Text.find(afterAuthority, "#")
+  let beforeFragment = match fragmentAt {
+    case Some(at) => afterAuthority.slice(0, at)
+    case None => afterAuthority
+  }
+  let fragment = match fragmentAt {
+    case Some(at) => Some(afterAuthority.drop(at + 1))
+    case None => None
+  }
+  match Text.find(beforeFragment, "?") {
+    case Some(at) => Parts{scheme: scheme, authority: named, path: beforeFragment.slice(0, at), query: Some(beforeFragment.drop(at + 1)), fragment: fragment}
+    case None => Parts{scheme: scheme, authority: named, path: beforeFragment, query: None, fragment: fragment}
+  }
+}
+
+/// The address the components write.
+export fn join(parts: &Parts) -> Str {
+  var text = ""
+  if let Some(scheme) = parts.scheme { text = text + scheme + ":" }
+  if let Some(named) = parts.authority { text = text + "//" + named }
+  text = text + parts.path
+  if let Some(query) = parts.query { text = text + "?" + query }
+  if let Some(fragment) = parts.fragment { text = text + "#" + fragment }
+  text
+}
+
+/// Whether the address names a scheme.
+export fn isAbsolute(text: Str) -> Bool { Option.isSome(&split(text).scheme) }
+
+/// The reference resolved against the base address, with dot segments removed.
+export fn resolve(base: Str, reference: Str) -> Str {
+  let from = split(base)
+  let given = split(reference)
+  if Option.isSome(&given.scheme) {
+    return join(&Parts{..given, path: removeDotSegments(given.path)})
+  }
+  let resolved = if Option.isSome(&given.authority) {
+    Parts{..given, scheme: from.scheme, path: removeDotSegments(given.path)}
+  } else if given.path.isEmpty() {
+    Parts{..from, query: if Option.isSome(&given.query) { given.query } else { from.query }, fragment: given.fragment}
+  } else if given.path.startsWith("/") {
+    Parts{..from, path: removeDotSegments(given.path), query: given.query, fragment: given.fragment}
+  } else {
+    Parts{..from, path: removeDotSegments(merge(&from, given.path)), query: given.query, fragment: given.fragment}
+  }
+  join(&resolved)
+}
+
+/// The path with every `.` and `..` segment applied.
+export fn removeDotSegments(path: Str) -> Str {
+  var input = path
+  var output: Array[Str] = []
+  while !input.isEmpty() {
+    if input.startsWith("../") {
+      input = input.drop(3)
+    } else if input.startsWith("./") {
+      input = input.drop(2)
+    } else if input.startsWith("/./") {
+      input = input.drop(2)
+    } else if input == "/." {
+      input = "/"
+    } else if input.startsWith("/../") {
+      input = input.drop(3)
+      output = withoutLast(&output)
+    } else if input == "/.." {
+      input = "/"
+      output = withoutLast(&output)
+    } else if input == "." || input == ".." {
+      input = ""
+    } else {
+      let next = match Text.find(input.drop(1), "/") {
+        case Some(at) => at + 1
+        case None => input.length()
+      }
+      output = output.push(input.slice(0, next))
+      input = input.drop(next)
+    }
+  }
+  output.join("")
+}
+
+/// The endpoint an absolute http or https address connects to, or `None` for any other address.
+export fn endpointOf(text: Str) -> Option[Endpoint] {
+  let parts = split(text)
+  let scheme = parts.scheme ?.toLower()
+  let secure = SCHEMES.get(scheme) ?
+  let named = parts.authority ?
+  let hostAndPort = match Text.find(named, "@") {
+    case Some(at) => named.drop(at + 1)
+    case None => named
+  }
+  let fallback = if secure { Defaults.HTTPS_PORT } else { Defaults.HTTP_PORT }
+  let (host, port) = hostPort(hostAndPort, fallback) ?
+  if host.isEmpty() { None } else { Some(Endpoint{scheme: scheme, host: host.toLower(), port: port, secure: secure}) }
+}
+
+/// The scheme, host, and port of an endpoint, as an origin.
+export fn origin(endpoint: &Endpoint) -> Str { endpoint.scheme + "://" + authority(endpoint) }
+
+/// The host and, when it is not the scheme's own, the port: the value of a `host` header.
+export fn authority(endpoint: &Endpoint) -> Str {
+  let named = if endpoint.host.contains(":") { "[" + endpoint.host + "]" } else { endpoint.host }
+  let fallback = if endpoint.secure { Defaults.HTTPS_PORT } else { Defaults.HTTP_PORT }
+  if endpoint.port == fallback { named } else { named + ":" + show(endpoint.port) }
+}
+
+/// The path and query of an address, as an origin-form request target.
+export fn target(text: Str) -> Str {
+  let parts = split(text)
+  let path = if parts.path.isEmpty() { "/" } else { parts.path }
+  match parts.query {
+    case Some(query) => path + "?" + query
+    case None => path
+  }
+}
+
+/// The address without its fragment, which is never sent.
+export fn withoutFragment(text: Str) -> Str { join(&Parts{..split(text), fragment: None}) }
+
+/// The address with every character a request line cannot carry percent-encoded as UTF-8.
+export fn escape(text: Str) -> Str {
+  var out = ""
+  for character in text.chars() {
+    let code = character.code()
+    if code > 32 && code < 127 {
+      out = out + character.toText()
+    } else {
+      for octet in character.toText().toBytes().toArray() {
+        let value = match convertInteger[Int](octet) {
+          case Some(held) => held
+          case None => 0
+        }
+        out = out + "%" + HEX.slice(value / 16, value / 16 + 1) + HEX.slice(value % 16, value % 16 + 1)
+      }
+    }
+  }
+  out
+}
+
+/// The address's scheme, when it names a valid one, and what follows its colon.
+fn schemeOf(text: Str) -> (Option[Str], Str) {
+  let end = firstOf(text, &[":", "/", "?", "#"])
+  if end == 0 || text.slice(end, end + 1) != ":" { return (None, text) }
+  let candidate = text.slice(0, end)
+  let first = candidate.chars()[0]
+  if Char.isLetter(first) && Char.isAscii(first) && Text.allChars(candidate, |c: Char| Char.isAlphanumeric(c) || c == '+' || c == '-' || c == '.') {
+    (Some(candidate), text.drop(end + 1))
+  } else { (None, text) }
+}
+
+/// The position of the earliest of the markers in the text, or its length when none occurs.
+fn firstOf(text: Str, markers: &Array[Str]) -> Int {
+  var earliest = text.length()
+  for marker in markers {
+    if let Some(at) = Text.find(text, marker) {
+      earliest = Math.min(earliest, at)
+    }
+  }
+  earliest
+}
+
+/// The base path up to its last segment, followed by the relative path.
+fn merge(base: &Parts, path: Str) -> Str {
+  if Option.isSome(&base.authority) && base.path.isEmpty() { return "/" + path }
+  Text.breakOnEnd(base.path, "/")[0] + path
+}
+
+/// The segments without the last one.
+fn withoutLast(segments: &Array[Str]) -> Array[Str] {
+  if segments.isEmpty() { *segments } else { segments.slice(0, segments.length() - 1) }
+}
+
+/// The host and port an authority names, with brackets removed from an IPv6 literal.
+fn hostPort(text: Str, fallback: Int) -> Option[(Str, Int)] {
+  if text.startsWith("[") {
+    let close = Text.find(text, "]") ?
+    let rest = text.drop(close + 1)
+    let port = if rest.isEmpty() { fallback } else { portOf(Text.stripPrefix(rest, ":")) ? }
+    return Some((text.slice(1, close), port))
+  }
+  let (front, back) = Text.breakOnEnd(text, ":")
+  if front.isEmpty() { Some((text, fallback)) } else { Some((Text.dropEnd(front, 1), portOf(back) ?)) }
+}
+
+/// A port number from 1 to 65535, or `None`.
+fn portOf(text: Str) -> Option[Int] {
+  let number = Text.countOf(text) ?
+  if number < 1 || number > 65535 { None } else { Some(number) }
+}

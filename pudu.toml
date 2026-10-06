@@ -1,0 +1,14 @@
+[package]
+name = "@chrismichaelps/pudu-lang-httpclient"
+version = "0.1.0"
+description = "Named HTTP clients for Pudu: a client factory, delegating handlers, pooled keep-alive connections, handler lifetimes, logging, and resilience"
+license = "Apache-2.0"
+keywords = ["http", "http-client", "client-factory", "connection-pooling", "handlers", "pudu"]
+language = ">=0.1.3 <0.2.0"
+source = "src"
+root = "PuduLangHttpClient"
+
+[dependencies]
+"@chrismichaelps/pudu-lang-log" = "^0.1.0"
+"@chrismichaelps/pudu-lang-resilience" = "^0.1.0"
+"@chrismichaelps/pudu-lang-mediator" = "=0.1.0"

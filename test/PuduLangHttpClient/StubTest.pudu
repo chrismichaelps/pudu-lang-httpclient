@@ -1,0 +1,54 @@
+/** @Test.Stub.Suite — a primary handler answering from rules */
+module PuduLangHttpClient.StubTest
+
+import Std.Bytes as ByteSeq
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Io as Io
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Test as Test
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+
+/// The status and text of an outcome.
+fn shape(outcome: &HttpClient.Outcome[Response.Response]) -> Result[(Int, Str), HttpClient.Failure] {
+  Result.map(*outcome, |response: Response.Response| (response.status.code, Result.unwrapOr(Response.text(&response), "")))
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.respond(&stub, Http.Get, "/users", 200, "[]")
+  Stub.on(&stub, Http.Post, "/users", |request: Request.Request| Ok(Response.answer(&request, 201).withText("made")))
+  Stub.when(&stub, |request: Request.Request| request.uri.contains("fail"), |_request: Request.Request| Err(HttpClient.Connection("down")))
+  let send = Stub.send(&stub)
+  let listed = shape(&send(Request.get("http://a/users?page=1"), Cancel.token()))
+  let made = shape(&send(Request.create(Http.Post, "http://a/users"), Cancel.token()))
+  let failed = shape(&send(Request.get("http://a/fail"), Cancel.token()))
+  let unknown = shape(&send(Request.get("http://a/none"), Cancel.token()))
+  let stopped = Cancel.token()
+  let _cancelled = Cancel.cancel(&stopped, "halt")
+  let refused = shape(&send(Request.get("http://a/users"), stopped))
+  let taken = Sync.cell(ByteSeq.empty())
+  let streamed = send(Request.get("http://a/users").withReceiver(fn(piece: Bytes) -> Bool {
+        let _kept = Sync.set(&taken, piece)
+        true
+      }), Cancel.token())
+  let checks = Test.suite("Stub", &[
+      Test.equals("a rule matches its method and path whatever the query", &listed, &Ok((200, "[]"))),
+      Test.equals("another method on the same path has its own rule", &made, &Ok((201, "made"))),
+      Test.equals("a rule may answer a failure", &failed, &Err(HttpClient.Connection("down"))),
+      Test.equals("a request no rule answers is not found", &unknown, &Ok((404, ""))),
+      Test.equals("a cancelled request is refused", &refused, &Err(HttpClient.Cancelled("cancelled: halt"))),
+      Test.equals("a receiver gets the body and the response keeps none", &(shape(&streamed), Result.unwrapOr(Sync.get(&taken), ByteSeq.empty()).toText()), &(Ok((200, "")), Some("[]"))),
+      Test.equals("every request received is kept in order, cancelled ones excepted", &Stub.received(&stub).map(|request: Request.Request| request.uri), &["http://a/users?page=1", "http://a/users", "http://a/fail", "http://a/none", "http://a/users"])
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

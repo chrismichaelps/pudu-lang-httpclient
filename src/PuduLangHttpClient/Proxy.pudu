@@ -1,0 +1,61 @@
+/** @HttpClient.Proxy.Module — a forward proxy requests are sent through */
+module PuduLangHttpClient.Proxy
+
+import Std.Http as Http
+import PuduLangHttpClient.Domain.Uri as Uri
+
+/** @HttpClient.Proxy.Proxy — the proxy's address, its credentials, and the hosts reached directly */
+export type Proxy = { address: Str, credentials: Option[(Str, Str)], bypass: Array[Str], bypassOnLocal: Bool }
+
+/// The hosts that name the machine itself.
+const LOCAL_HOSTS: Set[Str] = #{"localhost", "127.0.0.1", "::1"}
+
+/// A proxy at an `http` address, without credentials, reaching every host through it.
+export fn at(address: Str) -> Proxy { Proxy{address: address, credentials: None, bypass: [], bypassOnLocal: false} }
+
+/// Every reason the proxy cannot be used.
+export fn validate(proxy: &Proxy) -> Array[Str] {
+  match Uri.endpointOf(proxy.address) {
+    case Some(endpoint) => if endpoint.secure { ["proxy address must be an http address: " + proxy.address] } else { [] }
+    case None => ["proxy address must be an absolute http address: " + proxy.address]
+  }
+}
+
+/// Whether a request to `host` goes directly rather than through the proxy: the host is listed,
+/// matches a listed `*.suffix`, or is local while local hosts bypass.
+export fn bypasses(proxy: &Proxy, host: Str) -> Bool {
+  let lower = host.toLower()
+  if proxy.bypassOnLocal && (lower in LOCAL_HOSTS || lower.startsWith("127.") || !lower.contains(".")) { return true }
+  for entry in proxy.bypass {
+    let wanted = entry.toLower()
+    if wanted == lower || (wanted.startsWith("*.") && lower.endsWith(wanted.drop(1))) { return true }
+  }
+  false
+}
+
+/// The `proxy-authorization` value the credentials make, when there are credentials.
+export fn authorization(proxy: &Proxy) -> Option[Str] {
+  let (user, password) = proxy.credentials ?
+  Some(Http.basicAuth(user, password))
+}
+
+/** @HttpClient.Proxy.Configuring — a proxy changed one decision at a time */
+export trait Configuring {
+  /// The proxy authenticating with a user name and password.
+  fn withCredentials(self: &Self, user: Str, password: Str) -> Self
+  /// The proxy reached around for the listed hosts; `*.example.com` covers every name under it.
+  fn bypassing(self: &Self, hosts: &Array[Str]) -> Self
+  /// The proxy reached around for the machine itself and for names without a dot.
+  fn bypassingLocal(self: &Self) -> Self
+}
+
+impl Configuring for Proxy {
+  /// The proxy authenticating with a user name and password.
+  fn withCredentials(self: &Self, user: Str, password: Str) -> Self { Proxy{..*self, credentials: Some((user, password))} }
+
+  /// The proxy reached around for the listed hosts; `*.example.com` covers every name under it.
+  fn bypassing(self: &Self, hosts: &Array[Str]) -> Self { Proxy{..*self, bypass: self.bypass.concat(*hosts)} }
+
+  /// The proxy reached around for the machine itself and for names without a dot.
+  fn bypassingLocal(self: &Self) -> Self { Proxy{..*self, bypassOnLocal: true} }
+}

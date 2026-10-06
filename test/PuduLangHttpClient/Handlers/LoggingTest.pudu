@@ -1,0 +1,61 @@
+/** @Test.Handlers.Logging.Suite — structured events around a pipeline and its primary handler */
+module PuduLangHttpClient.Handlers.LoggingTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Constants.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Handlers.Logging as Logging
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Stub as Stub
+import PuduLangLog.Configuration as Configuration
+import PuduLangLog as Log
+import PuduLangLog.Sinks.Memory as Memory
+
+/// The levels of the events written with a template.
+fn levels(memory: &Memory.Memory, template: Str) -> Array[Log.Level] {
+  Memory.withTemplate(memory, template).map(|event: Log.Event| event.level)
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let memory = Memory.create()
+  let logger = Configuration.create().minimumLevel(Log.Verbose).writeTo(Memory.sink(&memory)).createLogger()
+  let stub = Stub.create()
+  Stub.respond(&stub, Http.Get, "/ok", 200, "fine")
+  Stub.when(&stub, |request: Request.Request| request.uri.endsWith("/down"), |_request: Request.Request| Err(HttpClient.Connection("refused")))
+  let factory = match Factory.build([
+      Builder.defaults().observedBy(Logging.observer(logger)),
+      Builder.named("api").withBaseAddress("http://api.test/").withPrimary(|| Stub.send(&stub)).withDefaultHeader("authorization", "Bearer secret").withDefaultHeader("x-api-key", "k").withDefaultHeader("accept", "*/*").redactingHeaders(&["x-api-key"]),
+      Builder.named("silent").withBaseAddress("http://api.test/").withPrimary(|| Stub.send(&stub)).withoutObservers()
+    ]) {
+    case Ok(found) => found
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let client = Factory.createClient(&factory, "api")
+  let _ok = Client.get(&client, "ok")
+  let _down = Client.get(&client, "down")
+  let afterApi = Memory.events(&memory).length()
+  let _quiet = Client.get(&Factory.createClient(&factory, "silent"), "ok")
+  let messages = Memory.messages(&memory)
+  let checks = Test.suite("Handlers.Logging", &[
+      Test.equals("a request entering and leaving the pipeline is information", &(levels(&memory, Events.PIPELINE_STARTED), levels(&memory, Events.PIPELINE_ENDED)), &([Log.Information, Log.Information], [Log.Information])),
+      Test.equals("a request reaching the primary handler is information", &(levels(&memory, Events.REQUEST_SENDING), levels(&memory, Events.RESPONSE_RECEIVED)), &([Log.Information, Log.Information], [Log.Information])),
+      Test.equals("a failure is a warning at both layers", &levels(&memory, Events.REQUEST_FAILED), &[Log.Warning, Log.Warning]),
+      Test.equals("headers are listed at the verbose level", &(levels(&memory, Events.REQUEST_HEADERS).length(), levels(&memory, Events.RESPONSE_HEADERS).length()), &(4, 2)),
+      Test.that("the start names the method and address", messages[0] == "Start processing HTTP request \"GET\" \"http://api.test/ok\""),
+      Test.that("sensitive and named header values are redacted and others kept", messages[1].contains("authorization: *") && messages[1].contains("x-api-key: *") && messages[1].contains("accept: */*") && !messages[1].contains("secret")),
+      Test.that("a failure names what went wrong", messages.filter(|line: Str| line.contains("failed after") && line.contains("The connection failed: refused")).length() == 2),
+      Test.equals("a client without observers writes nothing", &Memory.events(&memory).length(), &afterApi),
+      Test.equals("sources name the client and the layer", &(Logging.sourceOf("api", Events.LOGICAL_HANDLER), Logging.sourceOf("", Events.CLIENT_HANDLER)), &("PuduLangHttpClient.api.LogicalHandler", "PuduLangHttpClient.ClientHandler"))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

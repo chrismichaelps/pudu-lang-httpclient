@@ -1,0 +1,65 @@
+/** @Test.Domain.Cookie.Suite — cookies read from responses and matched to requests */
+module PuduLangHttpClient.Domain.CookieTest
+
+import Std.Io as Io
+import Std.Json as Json
+import Std.Test as Test
+import PuduLangHttpClient.Domain.Cookie as Cookie
+
+/// The moment every check is taken at.
+const NOW: Int = 1000000
+
+/// A cookie set by `host` for a request to `path`, known to parse.
+fn parsed(header: Str, host: Str, path: Str) -> Cookie.Stored {
+  match Cookie.parse(header, host, path, NOW) {
+    case Some(found) => found
+    case None => panic("did not parse: " + header)
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let plain = parsed("sid=\"abc\"", "Api.Test", "/v1/users")
+  let full = parsed("pref=1; Domain=.api.test; Path=/v1; Secure; HttpOnly; Max-Age=60; Expires=Thu, 01 Jan 1970 00:00:00 GMT", "www.api.test", "/")
+  let dated = parsed("d=1; Expires=Thu, 01 Jan 1970 00:16:41 GMT", "a.test", "/")
+  let gone = parsed("g=1; Max-Age=0", "a.test", "/")
+  let jar = Cookie.store(&Cookie.store(&[], &plain, NOW), &parsed("sid=new", "api.test", "/v1/x"), NOW + 5)
+  let checks = Test.suite("Domain.Cookie", &[
+      Test.equals("a plain cookie is host-only under the request's directory", &plain, &Cookie.Stored{name: "sid", value: "abc", domain: "api.test", hostOnly: true, path: "/v1", secure: false, httpOnly: false, expires: None, created: NOW}),
+      Test.equals("attributes set the domain, path, flags, and a max-age over expires", &full, &Cookie.Stored{name: "pref", value: "1", domain: "api.test", hostOnly: false, path: "/v1", secure: true, httpOnly: true, expires: Some(NOW + 60000), created: NOW}),
+      Test.equals("an expires date is used without a max-age", &dated.expires, &Some(1001000)),
+      Test.equals("a max-age of zero or less expires at once", &(gone.expires, parsed("g=1; Max-Age=-5", "a.test", "/").expires), &(Some(NOW), Some(NOW))),
+      Test.equals("a domain the host is not in, a missing name, or no equals sign is refused", &[Cookie.parse("x=1; Domain=other.test", "api.test", "/", NOW), Cookie.parse("=1", "a", "/", NOW), Cookie.parse("novalue", "a", "/", NOW), Cookie.parse(" =1", "a", "/", NOW)], &[None, None, None, None]),
+      Test.equals("an empty domain or a relative path is ignored", &(parsed("x=1; Domain=; Path=rel", "a.test", "/p/q").hostOnly, parsed("x=1; Domain=; Path=rel", "a.test", "/p/q").path), &(true, "/p")),
+      Test.that("a host matches its domain and the names under it", Cookie.domainMatches("a.test", "a.test") && Cookie.domainMatches("www.a.test", "a.test")),
+      Test.not("a host does not match a lookalike or an address's suffix", Cookie.domainMatches("evila.test", "a.test") || Cookie.domainMatches("1.2.3.4", "2.3.4") || Cookie.domainMatches("::1", ":1")),
+      Test.that("a path matches itself and the paths under it", Cookie.pathMatches("/v1", "/v1") && Cookie.pathMatches("/v1/x", "/v1") && Cookie.pathMatches("/v1/x", "/v1/") && Cookie.pathMatches("/v1/x", "/")),
+      Test.not("a path does not match a lookalike", Cookie.pathMatches("/v10", "/v1") || Cookie.pathMatches("/v", "/v1")),
+      Test.equals("default paths stop at the last segment", &[Cookie.defaultPath(""), Cookie.defaultPath("x"), Cookie.defaultPath("/"), Cookie.defaultPath("/a"), Cookie.defaultPath("/a/b"), Cookie.defaultPath("/a/b/")], &["/", "/", "/", "/", "/a", "/a/b"]),
+      Test.that("a host-only cookie applies only to its host", Cookie.applies(&plain, "API.test", "/v1/a", false, NOW) && !Cookie.applies(&plain, "www.api.test", "/v1/a", false, NOW)),
+      Test.that("a domain cookie applies under its domain only over a secured connection", Cookie.applies(&full, "x.api.test", "/v1", true, NOW) && !Cookie.applies(&full, "x.api.test", "/v1", false, NOW)),
+      Test.that("a cookie applies to an empty path when its path is the root", Cookie.applies(&dated, "a.test", "", false, NOW)),
+      Test.not("an expired cookie applies nowhere", Cookie.applies(&full, "api.test", "/v1", true, NOW + 60000)),
+      Test.that("a cookie expires exactly at its expiry", Cookie.expired(&full, NOW + 60000) && !Cookie.expired(&full, NOW + 59999) && !Cookie.expired(&plain, NOW * 1000)),
+      Test.equals("storing replaces a cookie of the same name, domain, and path and keeps its creation time", &jar.map(|c: Cookie.Stored| (c.value, c.created)), &[("new", NOW)]),
+      Test.equals("storing an expired cookie removes the one it replaces", &Cookie.store(&jar, &parsed("sid=x; Max-Age=0", "api.test", "/v1/x"), NOW), &[]),
+      Test.equals("storing drops cookies that have expired since", &Cookie.store(&[full], &plain, NOW + 70000).map(|c: Cookie.Stored| c.name), &["sid"]),
+      Test.equals("longer paths are sent first, then older cookies", &Cookie.render(&[Cookie.Stored{..plain, name: "b", path: "/", created: 2}, Cookie.Stored{..plain, name: "a", path: "/", created: 1}, Cookie.Stored{..plain, name: "c", path: "/v1/deep"}]), &"c=abc; a=abc; b=abc"),
+      Test.equals("cookies differing in name, domain, or path are kept apart", &[
+          Cookie.store(&[plain], &Cookie.Stored{..plain, name: "other"}, NOW).length(),
+          Cookie.store(&[plain], &Cookie.Stored{..plain, domain: "other.test"}, NOW).length(),
+          Cookie.store(&[plain], &Cookie.Stored{..plain, path: "/other"}, NOW).length()
+        ], &[2, 2, 2]),
+      Test.not("an address ending in a zero or a nine does not match by suffix", Cookie.domainMatches("10.0.0.0", "0.0.0") || Cookie.domainMatches("19.9.9.9", "9.9.9")),
+      Test.equals("an empty quoted value is empty and an unquoted short value is kept", &(parsed("e=\"\"", "a.test", "/").value, parsed("s=ab", "a.test", "/").value, parsed("q=\"", "a.test", "/").value), &("", "ab", "\"")),
+      Test.equals("an attribute without a name is ignored", &parsed("x=1; =v; Path=/p", "a.test", "/").path, &"/p"),
+      Test.equals("cookies with equal paths and times keep their order", &Cookie.render(&[Cookie.Stored{..plain, name: "x"}, Cookie.Stored{..plain, name: "y"}]), &"x=abc; y=abc"),
+      Test.that("only a cookie with an expiry is persistent", Cookie.isPersistent(&full) && !Cookie.isPersistent(&plain)),
+      Test.equals("a stored cookie writes itself as JSON and reads back the same", &Json.decode(Json.encode(&full.encode())), &Ok(full.encode()))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

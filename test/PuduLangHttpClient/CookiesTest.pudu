@@ -1,0 +1,44 @@
+/** @Test.Cookies.Suite — a jar of cookies shared by the requests of one transport */
+module PuduLangHttpClient.CookiesTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Cookies as Cookies
+import PuduLangHttpClient.Domain.Cookie as Cookie
+import PuduLangHttpClient as HttpClient
+
+/// Runs the suite.
+fn main() -> Int {
+  let jar = Cookies.jar()
+  Cookies.store(&jar, "https://shop.test/cart/items", &["cart=3; Path=/cart; Max-Age=3600", "session=s1", "secure=1; Secure; Max-Age=3600", "broken"])
+  Cookies.add(&jar, "https://shop.test/", "lang", "en")
+  Cookies.store(&jar, "not an address", &["x=1"])
+  let atCart = Cookies.header(&jar, "https://shop.test/cart/add")
+  let plainRoot = Cookies.header(&jar, "http://shop.test/")
+  let elsewhere = Cookies.header(&jar, "https://other.test/")
+  let saved = Cookies.save(&jar)
+  let restoredJar = Cookies.jar()
+  let restored = Cookies.restore(&restoredJar, saved)
+  let refused = Cookies.restore(&Cookies.jar(), "not json")
+  Cookies.clearSession(&jar)
+  let afterSession = Cookies.cookies(&jar).map(|cookie: Cookie.Stored| cookie.name)
+  Cookies.clear(&jar)
+  let checks = Test.suite("Cookies", &[
+      Test.equals("a request carries the cookies for its host, path, and security, longer paths first", &atCart, &Some("cart=3; session=s1; secure=1; lang=en")),
+      Test.equals("a plain request at the root carries neither the secured cookies nor those under a deeper default path", &plainRoot, &Some("lang=en")),
+      Test.equals("another host carries none", &elsewhere, &None),
+      Test.equals("an address that is not http matches nothing", &Cookies.cookiesFor(&jar, "mailto:x"), &[]),
+      Test.equals("saving and restoring keeps the persistent cookies", &(restored, Cookies.cookies(&restoredJar).map(|cookie: Cookie.Stored| cookie.name)), &(Ok(()), ["cart", "secure"])),
+      Test.that("text that is not a saved jar is refused", match refused {
+          case Err(HttpClient.Unreadable(_)) => true
+          case _ => false
+        }),
+      Test.equals("clearing the session keeps the persistent cookies", &afterSession, &["cart", "secure"]),
+      Test.equals("clearing empties the jar", &Cookies.cookies(&jar), &[])
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

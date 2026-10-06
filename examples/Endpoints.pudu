@@ -1,0 +1,46 @@
+/** @Examples.Endpoints.Program — declarative endpoints filled from arguments and read as JSON */
+module Endpoints
+
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Io as Io
+import Std.Json as Json
+import Std.Option as Option
+import PuduLangHttpClient.Endpoint as Endpoint
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient as HttpClient
+
+/** @Examples.Endpoints.Repository — one repository as the service describes it */
+type Repository = { owner: Str, name: Str, stars: Int } derives Json.Encode, Json.Decode
+
+/// The repository of an owner, by name.
+const REPOSITORY: Endpoint.Endpoint = Endpoint.Endpoint{method: Http.Get, template: "repos/:owner/:name"}
+
+/// Starts a local service of repositories and answers its address.
+fn serve() -> (Server.Running, Str) {
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let server = Server.server(&Route.routing(&[Route.get("/repos/:owner/:name", |request: Route.Request| Reply.json(200, "\{\"owner\":\"" + Option.unwrapOr(Route.param(&request, "owner"), "") + "\",\"name\":\"" + Option.unwrapOr(Route.param(&request, "name"), "") + "\",\"stars\":42\}"))]))
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  (running, "http://127.0.0.1:" + show(Server.portOf(&running)) + "/")
+}
+
+/// Calls a declared endpoint and answers 0 when the value read back is the one described.
+fn main() -> Int {
+  let (running, base) = serve()
+  let factory = match Factory.build([Builder.named("code").withBaseAddress(base)]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let found: HttpClient.Outcome[Repository] = Endpoint.call(&Factory.createClient(&factory, "code"), &REPOSITORY, &[("owner", "chrismichaelps"), ("name", "pudu-lang")])
+  let _said = Io.writeLine(show(found))
+  Factory.dispose(&factory)
+  let _stopped = Server.stop(&running)
+  if found == Ok(Repository{owner: "chrismichaelps", name: "pudu-lang", stars: 42}) { 0 } else { 1 }
+}

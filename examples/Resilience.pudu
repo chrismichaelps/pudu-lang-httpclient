@@ -1,0 +1,57 @@
+/** @Examples.Resilience.Program — the standard resilience pipeline against a flaky server */
+module Resilience
+
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Io as Io
+import Std.Result as Result
+import Std.Sync as Sync
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Handlers.Resilience as Resilience
+import PuduLangHttpClient as HttpClient
+import PuduLangResilience.Retry as Retry
+
+/// Starts a local server that is busy for the first two requests and answers its address.
+fn serve(seen: &Sync.Counter) -> (Server.Running, Str) {
+  let counter = *seen
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let server = Server.server(&Route.routing(&[Route.get("/stock", fn(_request: Route.Request) -> Http.Response {
+            let attempt = Result.unwrapOr(Sync.increment(&counter, 1), 0)
+            if attempt <= 2 { Http.Response{..Reply.text(503, "busy"), headers: [("retry-after", "0")]} } else { Reply.text(200, "12 in stock") }
+          })]))
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  (running, "http://127.0.0.1:" + show(Server.portOf(&running)) + "/")
+}
+
+/// Reads stock through the standard pipeline, retrying the busy answers, and answers 0 on success.
+fn main() -> Int {
+  let seen = Sync.counter(0)
+  let (running, base) = serve(&seen)
+  let options = Resilience.standardOptions()
+  let quick = Resilience.Standard{..options, retry: Retry.Options{..options.retry, delay: 10}}
+  let pipeline = match Resilience.standardWith(&quick) {
+    case Ok(built) => built
+    case Err(_) => panic("the standard pipeline did not build")
+  }
+  let factory = match Factory.build([Builder.named("inventory").withBaseAddress(base).withHandler(Resilience.handler(pipeline))]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let stock = Client.getText(&Factory.createClient(&factory, "inventory"), "stock")
+  let attempts = Result.unwrapOr(Sync.count(&seen), 0)
+  let _said = Io.writeLine(match stock {
+      case Ok(text) => text + " after " + show(attempts) + " attempts"
+      case Err(failure) => HttpClient.describe(&failure)
+    })
+  Factory.dispose(&factory)
+  let _stopped = Server.stop(&running)
+  if stock == Ok("12 in stock") && attempts == 3 { 0 } else { 1 }
+}

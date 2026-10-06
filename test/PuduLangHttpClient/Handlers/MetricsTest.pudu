@@ -1,0 +1,35 @@
+/** @Test.Handlers.Metrics.Suite — counts and durations of the requests through a pipeline */
+module PuduLangHttpClient.Handlers.MetricsTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Io as Io
+import Std.Json as Json
+import Std.Test as Test
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Handlers.Metrics as Metrics
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+
+/// Runs the suite.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.when(&stub, |request: Request.Request| request.uri.endsWith("/fail"), |_request: Request.Request| Err(HttpClient.ResponseEnded))
+  Stub.when(&stub, |_request: Request.Request| true, |request: Request.Request| Ok(Response.answer(&request, match request.uri.split("/").reverse()[0].toInt() { case Some(code) => code case None => 200 })))
+  let meter = Metrics.meter()
+  let send = Handler.around(Metrics.handler(&meter), Stub.send(&stub))
+  for path in ["100", "200", "204", "302", "404", "500", "fail"] { let _sent = send(Request.get("http://a/" + path), Cancel.token()) }
+  let snapshot = Metrics.snapshot(&meter)
+  let checks = Test.suite("Handlers.Metrics", &[
+      Test.equals("every request is counted by status class or as failed", &(snapshot.requests, snapshot.informational, snapshot.successful, snapshot.redirected, snapshot.clientErrors, snapshot.serverErrors, snapshot.failed), &(7, 1, 2, 1, 1, 1, 1)),
+      Test.equals("nothing is left in flight", &snapshot.active, &0),
+      Test.that("durations are added up and the longest kept", snapshot.totalMillis >= snapshot.longestMillis && snapshot.longestMillis >= 0),
+      Test.that("a snapshot writes itself as JSON", Json.encode(&snapshot.encode()).startsWith("\{\"requests\":7,\"active\":0,"))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

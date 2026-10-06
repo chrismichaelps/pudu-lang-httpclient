@@ -1,0 +1,178 @@
+/** @Test.Transport.Suite — the pooled primary handler against a loopback server */
+module PuduLangHttpClient.TransportTest
+
+import Std.Compress.Gzip as Gzip
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Io as Io
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Cookies as Cookies
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport.Pool as Pool
+import PuduLangHttpClient.Transport as Transport
+import Support.Loopback as Loopback
+
+/// The response a request gets through a transport within five seconds.
+fn fetch(transport: &Transport.Transport, request: Request.Request) -> HttpClient.Outcome[Response.Response] {
+  Transport.send(transport)(request, Cancel.expiring(5000))
+}
+
+/// The status and text of an outcome.
+fn summary(outcome: &HttpClient.Outcome[Response.Response]) -> Result[(Int, Str), HttpClient.Failure] {
+  Result.map(*outcome, |response: Response.Response| (response.status.code, Result.unwrapOr(Response.text(&response), "")))
+}
+
+/// The body of a summary, or empty text.
+fn bodyOf(summarized: &Result[(Int, Str), HttpClient.Failure]) -> Str {
+  match summarized {
+    case Ok((_, body)) => body
+    case Err(_) => ""
+  }
+}
+
+/// A response with a status and headers and no body.
+fn bare(code: Int, headers: Array[(Str, Str)]) -> Http.Response { Http.Response{status: Http.status(code), headers: headers, body: "", binaryBody: None} }
+
+/// The routes every check talks to.
+fn routes() -> Array[Route.Route] {
+  [
+    Route.get("/hello", |_request: Route.Request| Reply.text(200, "hello")),
+    Route.post("/echo", |request: Route.Request| Reply.text(200, Route.body(&request))),
+    Route.get("/headers", |request: Route.Request| Reply.text(200, request.message.headers.map(|pair: (Str, Str)| pair[0].toLower() + "=" + pair[1]).join("|"))),
+    Route.get("/found", |_request: Route.Request| bare(302, [("location", "/hello")])),
+    Route.post("/see-other", |_request: Route.Request| bare(303, [("location", "/hello")])),
+    Route.post("/temporary", |_request: Route.Request| bare(307, [("location", "/echo")])),
+    Route.get("/loop", |_request: Route.Request| bare(302, [("location", "/loop")])),
+    Route.get("/set", |_request: Route.Request| bare(200, [("set-cookie", "session=abc; Path=/"), ("set-cookie", "theme=dark; Max-Age=3600")])),
+    Route.get("/gzip", |_request: Route.Request| Http.Response{..Reply.bytes(200, "text/plain", &Gzip.compressText("compressed hello", &Gzip.config())), headers: [("content-type", "text/plain"), ("content-encoding", "gzip")]}),
+    Route.get("/big", |_request: Route.Request| Reply.text(200, "0123456789")),
+    Route.get("/slow", |_request: Route.Request| {
+        let _waited = Concurrent.sleep(150)
+        Reply.text(200, "slow")
+      })
+  ]
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let server = Loopback.serve(&routes())
+  let base = server.base
+  let pooled = Transport.create(Transport.defaults())
+  let first = summary(&fetch(&pooled, Request.get(base + "/hello")))
+  let second = summary(&fetch(&pooled, Request.get(base + "/hello")))
+  let reuse = Transport.statistics(&pooled)
+  let echoed = summary(&fetch(&pooled, Request.post(base + "/echo", Content.plain("ping"))))
+  let found = fetch(&pooled, Request.get(base + "/found"))
+  let seeOther = fetch(&pooled, Request.post(base + "/see-other", Content.plain("gone")))
+  let temporary = summary(&fetch(&pooled, Request.post(base + "/temporary", Content.plain("kept"))))
+  let looping = fetch(&Transport.create(Transport.defaults().withMaxRedirects(3)), Request.get(base + "/loop"))
+  let unfollowed = summary(&fetch(&Transport.create(Transport.defaults().withoutRedirects()), Request.get(base + "/found")))
+
+  let jar = Cookies.jar()
+  let cookied = Transport.create(Transport.defaults().withCookies(jar))
+  let _set = fetch(&cookied, Request.get(base + "/set"))
+  let sentCookies = summary(&fetch(&cookied, Request.get(base + "/headers")))
+  let ownJar = Transport.cookies(&Transport.create(Transport.defaults().usingCookies()))
+
+  let decompressing = Transport.create(Transport.defaults().withDecompression())
+  let unzipped = fetch(&decompressing, Request.get(base + "/gzip"))
+  let asked = summary(&fetch(&decompressing, Request.get(base + "/headers")))
+  let zipped = fetch(&pooled, Request.get(base + "/gzip"))
+
+  let publicOnly = fetch(&Transport.create(Transport.defaults().withAddressPolicy(Transport.PublicOnly([]))), Request.get(base + "/hello"))
+  let permitted = summary(&fetch(&Transport.create(Transport.defaults().withAddressPolicy(Transport.PublicOnly(["127.0.0.1"]))), Request.get(base + "/hello")))
+  let limited = fetch(&pooled, Request.get(base + "/big").withOption(&Transport.bufferLimit(), 4))
+  let headLimited = fetch(&Transport.create(Transport.defaults().withMaxResponseHeadersLength(8)), Request.get(base + "/hello"))
+  let timedOut = Transport.send(&pooled)(Request.get(base + "/slow"), Cancel.expiring(40))
+  let cancelledToken = Cancel.token()
+  let _cancelled = Cancel.cancel(&cancelledToken, "stop")
+  let cancelled = Transport.send(&pooled)(Request.get(base + "/hello"), cancelledToken)
+
+  let shortLived = Transport.create(Transport.defaults().withPooledConnectionLifetime(0))
+  let _a = fetch(&shortLived, Request.get(base + "/hello"))
+  let _b = fetch(&shortLived, Request.get(base + "/hello"))
+  let idle = Transport.create(Transport.defaults().withPooledConnectionIdleTimeout(30))
+  let _c = fetch(&idle, Request.get(base + "/hello"))
+  let _rested = Concurrent.sleep(60)
+  let _d = fetch(&idle, Request.get(base + "/hello"))
+
+  let single = Transport.create(Transport.defaults().withMaxConnectionsPerServer(1))
+  let workers = [1, 2, 3, 4].map(|_n: Int| Result.unwrapOr(Concurrent.start(fn() -> () { let _e = fetch(&single, Request.get(base + "/slow")) }), Concurrent.Task{token: 0}))
+  let _joined = Concurrent.joinAll(&workers)
+
+  let closing = Transport.create(Transport.defaults())
+  let _f = fetch(&closing, Request.get(base + "/hello"))
+  Transport.close(&closing)
+  let afterClose = summary(&fetch(&closing, Request.get(base + "/hello")))
+
+  let exact2 = fetch(&pooled, Request.get(base + "/hello").withVersion(Http.Http2, Version.Exact))
+  let lower2 = summary(&fetch(&pooled, Request.get(base + "/hello").withVersion(Http.Http2, Version.OrLower)))
+  let badHeader = fetch(&pooled, Request.get(base + "/hello").withHeader("x-bad", "a\r\nb: c"))
+  let notHttp = fetch(&pooled, Request.get("ftp://example.test/"))
+  let refused = fetch(&pooled, Request.get("http://127.0.0.1:1/"))
+  Loopback.stop(&server)
+
+  let checks = Test.suite("Transport", &[
+      Test.equals("a get answers its status and body", &first, &Ok((200, "hello"))),
+      Test.equals("a second request answers the same", &second, &Ok((200, "hello"))),
+      Test.equals("a kept-alive connection serves the second request", &(reuse.opened, reuse.reused, reuse.idle), &(1, 1, 1)),
+      Test.equals("a post carries its body", &echoed, &Ok((200, "ping"))),
+      Test.equals("a found redirect is followed to the final address", &Result.map(found, |r: Response.Response| (r.status.code, r.request.uri)), &Ok((200, base + "/hello"))),
+      Test.equals("a see-other redirect turns a post into a get without a body", &Result.map(seeOther, |r: Response.Response| (r.request.method, r.request.content == None)), &Ok((Http.Get, true))),
+      Test.equals("a temporary redirect keeps the method and the body", &temporary, &Ok((200, "kept"))),
+      Test.equals("a redirect loop stops at the limit", &Result.map(looping, |r: Response.Response| r.status.code), &Err(HttpClient.TooManyRedirects(3))),
+      Test.equals("a transport without redirects answers the redirect", &unfollowed, &Ok((302, ""))),
+      Test.that("a jar sends back the cookies a response set", bodyOf(&sentCookies).contains("cookie=session=abc; theme=dark")),
+      Test.equals("the jar holds both cookies", &Cookies.cookies(&jar).length(), &2),
+      Test.that("a transport using cookies without a jar makes its own", ownJar != None),
+      Test.equals("a gzip body is decompressed and its encoding removed", &Result.map(unzipped, |r: Response.Response| (Result.unwrapOr(Response.text(&r), ""), Response.header(&r, "content-encoding"))), &Ok(("compressed hello", None))),
+      Test.that("a decompressing transport asks for gzip", bodyOf(&asked).contains("accept-encoding=gzip")),
+      Test.equals("a transport that does not decompress keeps the encoding", &Result.map(zipped, |r: Response.Response| Response.header(&r, "content-encoding")), &Ok(Some("gzip"))),
+      Test.that("a public-only policy refuses the loopback address", match publicOnly {
+          case Err(HttpClient.NotPermitted(_)) => true
+          case _ => false
+        }),
+      Test.equals("a permitted host is reached", &permitted, &Ok((200, "hello"))),
+      Test.equals("a body over the request's limit is refused", &Result.map(limited, |r: Response.Response| r.status.code), &Err(HttpClient.ContentTooLarge(4))),
+      Test.equals("a head over the limit is refused", &Result.map(headLimited, |r: Response.Response| r.status.code), &Err(HttpClient.HeadersTooLarge(8))),
+      Test.that("a request past its deadline times out", match timedOut {
+          case Err(HttpClient.TimedOut(_)) => true
+          case _ => false
+        }),
+      Test.equals("a cancelled token stops the request before it is sent", &Result.map(cancelled, |r: Response.Response| r.status.code), &Err(HttpClient.Cancelled("stop"))),
+      Test.equals("a connection lifetime of zero opens a connection per request", &Transport.statistics(&shortLived).opened, &2),
+      Test.equals("an idle connection past its timeout is replaced", &(Transport.statistics(&idle).opened, Transport.statistics(&idle).closed), &(2, 1)),
+      Test.equals("a per-server limit of one serves every request over one connection", &(Transport.statistics(&single).opened, Transport.statistics(&single).active), &(1, 0)),
+      Test.equals("a closed transport still answers", &afterClose, &Ok((200, "hello"))),
+      Test.equals("a closed transport keeps no connection", &(Transport.statistics(&closing).idle, Transport.isClosed(&closing)), &(0, true)),
+      Test.equals("an exact HTTP/2 request is refused", &Result.map(exact2, |r: Response.Response| r.status.code), &Err(HttpClient.VersionUnsupported("HTTP/2"))),
+      Test.equals("an HTTP/2 request that may go lower is sent as HTTP/1.1", &lower2, &Ok((200, "hello"))),
+      Test.that("a header with a line break is refused", match badHeader {
+          case Err(HttpClient.InvalidRequest(_)) => true
+          case _ => false
+        }),
+      Test.that("an address that is not http is refused", match notHttp {
+          case Err(HttpClient.InvalidRequest(_)) => true
+          case _ => false
+        }),
+      Test.that("a refused connection is a connection failure", match refused {
+          case Err(HttpClient.Connection(_)) => true
+          case _ => false
+        }),
+      Test.equals("the defaults are valid", &Transport.validate(&Transport.defaults()), &[]),
+      Test.equals("every invalid option is reported", &Transport.validate(&Transport.defaults().withMaxConnectionsPerServer(0).withMaxRedirects(0).withConnectTimeout(0).withPooledConnectionLifetime(-5).withPooledConnectionIdleTimeout(-2).withMaxResponseHeadersLength(0).withMaxResponseContentLength(-1)).length(), &7)
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

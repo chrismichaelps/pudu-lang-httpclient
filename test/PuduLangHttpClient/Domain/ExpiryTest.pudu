@@ -1,0 +1,23 @@
+/** @Test.Domain.Expiry.Suite — lifetimes, idle limits, and deadlines */
+module PuduLangHttpClient.Domain.ExpiryTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Domain.Expiry as Expiry
+
+/// Runs the suite.
+fn main() -> Int {
+  let checks = Test.suite("Domain.Expiry", &[
+      Test.that("a lifetime runs out exactly when it has elapsed", Expiry.elapsed(100, 50, 150) && !Expiry.elapsed(100, 50, 149)),
+      Test.that("a lifetime of zero has already run out", Expiry.elapsed(100, 0, 100)),
+      Test.not("an infinite lifetime never runs out", Expiry.elapsed(0, Defaults.INFINITE, Defaults.UNLIMITED)),
+      Test.equals("what remains of a deadline never falls below zero", &[Expiry.remaining(Some(150), 100), Expiry.remaining(Some(100), 100), Expiry.remaining(Some(50), 100), Expiry.remaining(None, 100)], &[Some(50), Some(0), Some(0), None]),
+      Test.equals("the earlier deadline wins and an absent one loses", &[Expiry.earliest(Some(5), Some(3)), Expiry.earliest(Some(3), Some(5)), Expiry.earliest(Some(4), Some(4)), Expiry.earliest(Some(5), None), Expiry.earliest(None, Some(5)), Expiry.earliest(None, None)], &[Some(3), Some(3), Some(4), Some(5), Some(5), None])
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

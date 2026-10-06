@@ -1,0 +1,94 @@
+/** @HttpClient.Root.Vocabulary — outcomes and failures of HTTP requests */
+module PuduLangHttpClient
+
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Utils.Template as Template
+
+/** @HttpClient.Root.Failure — why a request produced no response */
+export type Failure
+  = InvalidRequest(Str)
+  | NameResolution(Str)
+  | Connection(Str)
+  | SecureConnection(Str)
+  | ProxyTunnel(Str)
+  | Protocol(Str)
+  | ResponseEnded
+  | ContentTooLarge(Int)
+  | HeadersTooLarge(Int)
+  | TooManyRedirects(Int)
+  | NotPermitted(Str)
+  | VersionUnsupported(Str)
+  | TimedOut(Int)
+  | Cancelled(Str)
+  | Unsuccessful(Int, Str)
+  | Unreadable(Str)
+  | Rejected(Str)
+  | Crashed(Str)
+
+/** @HttpClient.Root.Outcome — the value or failure of one request */
+export type Outcome[T] = Result[T, Failure]
+
+/// An outcome refusing a request that cannot be sent as written.
+export fn invalid[T](reason: Str) -> Outcome[T] { Err(InvalidRequest(reason)) }
+
+/// Whether repeating the request may succeed where this attempt failed: a broken or refused
+/// connection, an unresolved name, a response cut short or malformed, or a timeout.
+export fn isTransient(failure: &Failure) -> Bool {
+  match failure {
+    case NameResolution(_) => true
+    case Connection(_) => true
+    case ProxyTunnel(_) => true
+    case Protocol(_) => true
+    case ResponseEnded => true
+    case TimedOut(_) => true
+    case _ => false
+  }
+}
+
+/// Whether the failure is a cancellation.
+export fn isCancellation(failure: &Failure) -> Bool {
+  match failure {
+    case Cancelled(_) => true
+    case _ => false
+  }
+}
+
+/// Whether the failure is a timeout.
+export fn isTimeout(failure: &Failure) -> Bool {
+  match failure {
+    case TimedOut(_) => true
+    case _ => false
+  }
+}
+
+/// The status code a failure reports, when it reports one.
+export fn statusOf(failure: &Failure) -> Option[Int] {
+  match failure {
+    case Unsuccessful(code, _) => Some(code)
+    case _ => None
+  }
+}
+
+/// One sentence saying what went wrong.
+export fn describe(failure: &Failure) -> Str {
+  match failure {
+    case InvalidRequest(reason) => Template.fill(Messages.INVALID_REQUEST, &[reason])
+    case NameResolution(reason) => Template.fill(Messages.NAME_RESOLUTION, &[reason])
+    case Connection(reason) => Template.fill(Messages.CONNECTION, &[reason])
+    case SecureConnection(reason) => Template.fill(Messages.SECURE_CONNECTION, &[reason])
+    case ProxyTunnel(reason) => Template.fill(Messages.PROXY_TUNNEL, &[reason])
+    case Protocol(reason) => Template.fill(Messages.PROTOCOL, &[reason])
+    case ResponseEnded => Messages.RESPONSE_ENDED
+    case ContentTooLarge(limit) => Template.fill(Messages.CONTENT_TOO_LARGE, &[show(limit)])
+    case HeadersTooLarge(limit) => Template.fill(Messages.HEADERS_TOO_LARGE, &[show(limit)])
+    case TooManyRedirects(limit) => Template.fill(Messages.TOO_MANY_REDIRECTS, &[show(limit)])
+    case NotPermitted(reason) => Template.fill(Messages.NOT_PERMITTED, &[reason])
+    case VersionUnsupported(version) => Template.fill(Messages.VERSION_UNSUPPORTED, &[version])
+    case TimedOut(millis) => Template.fill(Messages.TIMED_OUT, &[show(millis)])
+    case Cancelled(reason) => Template.fill(Messages.CANCELLED, &[reason])
+    case Unsuccessful(code, reason) => Template.fill(Messages.UNSUCCESSFUL, &[show(code), reason])
+    case Unreadable(reason) => Template.fill(Messages.UNREADABLE, &[reason])
+    case Rejected(reason) => Template.fill(Messages.REJECTED, &[reason])
+    case Crashed(reason) => Template.fill(Messages.CRASHED, &[reason])
+  }
+}

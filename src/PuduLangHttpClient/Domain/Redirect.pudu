@@ -1,0 +1,38 @@
+/** @Domain.Redirect.Module — which redirects are followed, and how the request changes */
+module PuduLangHttpClient.Domain.Redirect
+
+import Std.Http as Http
+import PuduLangHttpClient.Domain.Uri as Uri
+
+/** @Domain.Redirect.Hop — the request a followed redirect sends next */
+export type Hop = { method: Http.Method, uri: Str, keepsBody: Bool, keepsCredentials: Bool }
+
+/// The statuses that redirect.
+const REDIRECTS: Set[Int] = #{300, 301, 302, 303, 307, 308}
+
+/// The statuses after which a request that is not a `GET` or `HEAD` is sent again as a `GET`.
+const TO_GET_AFTER_POST: Set[Int] = #{300, 301, 302}
+
+/// Whether a status redirects.
+export fn isRedirect(code: Int) -> Bool { code in REDIRECTS }
+
+/// The request that follows a redirect from `from` to `location`, or `None` when it is not followed:
+/// the status does not redirect, the location is not an http or https address, or it leaves https
+/// for http.
+///
+/// A `303` turns every method but `HEAD` into `GET`; `300`, `301`, and `302` turn a `POST` into a
+/// `GET`; `307` and `308` keep the method and the body. Credentials survive only within one origin.
+export fn next(method: &Http.Method, code: Int, from: Str, location: Str) -> Option[Hop] {
+  if !isRedirect(code) || location.trim().isEmpty() { return None }
+  let destination = Uri.withoutFragment(Uri.resolve(from, Uri.escape(location.trim())))
+  let target = Uri.endpointOf(destination) ?
+  let origin = Uri.endpointOf(from) ?
+  if origin.secure && !target.secure { return None }
+  let changed = (code == 303 && *method != Http.Head) || (*method == Http.Post && code in TO_GET_AFTER_POST)
+  Some(Hop {
+      method: if changed { Http.Get } else { *method },
+      uri: destination,
+      keepsBody: !changed,
+      keepsCredentials: Uri.origin(&origin) == Uri.origin(&target)
+    })
+}

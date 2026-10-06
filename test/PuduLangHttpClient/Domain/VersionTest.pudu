@@ -1,0 +1,26 @@
+/** @Test.Domain.Version.Suite — the protocol version a request is sent with */
+module PuduLangHttpClient.Domain.VersionTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Domain.Version as Version
+
+/// The version sent for each requested version under a policy.
+fn under(policy: Version.Policy) -> Array[Option[Http.Version]] {
+  [Http.Http10, Http.Http11, Http.Http2, Http.Http3].map(|version: Http.Version| Version.negotiate(&version, &policy))
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let checks = Test.suite("Domain.Version", &[
+      Test.equals("or-lower sends the highest version spoken at or below the request", &under(Version.OrLower), &[Some(Http.Http10), Some(Http.Http11), Some(Http.Http11), Some(Http.Http11)]),
+      Test.equals("exact sends only a version spoken", &under(Version.Exact), &[Some(Http.Http10), Some(Http.Http11), None, None]),
+      Test.equals("or-higher sends the highest version spoken at or above the request", &under(Version.OrHigher), &[Some(Http.Http11), Some(Http.Http11), None, None])
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

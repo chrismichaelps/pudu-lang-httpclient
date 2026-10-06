@@ -1,0 +1,101 @@
+/** @Constants.Messages.Module — every sentence the package reports */
+module PuduLangHttpClient.Constants.Messages
+
+/// A request that cannot be sent as written; `<1>` is why.
+export const INVALID_REQUEST: Str = "The request is invalid: <1>"
+
+/// A host name that resolved to no address; `<1>` is what the resolver said.
+export const NAME_RESOLUTION: Str = "The host name could not be resolved: <1>"
+
+/// A connection that could not be opened or broke; `<1>` is why.
+export const CONNECTION: Str = "The connection failed: <1>"
+
+/// A secured connection that could not be established; `<1>` is why.
+export const SECURE_CONNECTION: Str = "The secured connection failed: <1>"
+
+/// A proxy that refused to open a tunnel; `<1>` is why.
+export const PROXY_TUNNEL: Str = "The proxy did not open a tunnel: <1>"
+
+/// A response that broke the protocol; `<1>` is how.
+export const PROTOCOL: Str = "The response broke the protocol: <1>"
+
+/// A connection that closed before the response was complete.
+export const RESPONSE_ENDED: Str = "The connection closed before the response was complete."
+
+/// A response body over the buffer limit; `<1>` is the limit in bytes.
+export const CONTENT_TOO_LARGE: Str = "The response body is larger than <1> bytes."
+
+/// A response head over the limit; `<1>` is the limit in bytes.
+export const HEADERS_TOO_LARGE: Str = "The response headers are larger than <1> bytes."
+
+/// A template slot with no argument; `<1>` is the slot's name.
+export const UNFILLED_SLOT: Str = "the template slot '<1>' has no argument"
+
+/// A redirect chain over the limit; `<1>` is the limit.
+export const TOO_MANY_REDIRECTS: Str = "The request was redirected more than <1> times."
+
+/// A destination the address policy refuses; `<1>` is why.
+export const NOT_PERMITTED: Str = "The destination is not permitted: <1>"
+
+/// A protocol version the transport cannot speak under the request's policy; `<1>` is the version.
+export const VERSION_UNSUPPORTED: Str = "The request asks for <1>, which the transport does not speak."
+
+/// A request whose deadline passed; `<1>` is the timeout in milliseconds.
+export const TIMED_OUT: Str = "The request timed out after <1> ms."
+
+/// A cancelled request; `<1>` is the reason.
+export const CANCELLED: Str = "The request was cancelled: <1>"
+
+/// A response whose status is not a success; `<1>` is the code and `<2>` the reason phrase.
+export const UNSUCCESSFUL: Str = "The response status <1> (<2>) does not indicate success."
+
+/// A body that cannot be read as asked; `<1>` is why.
+export const UNREADABLE: Str = "The body could not be read: <1>"
+
+/// A request a resilience strategy refused; `<1>` is the strategy's description.
+export const REJECTED: Str = "The request was rejected: <1>"
+
+/// A handler that stopped its thread; `<1>` is what it said.
+export const CRASHED: Str = "A handler stopped its thread: <1>"
+
+/// A body that is not UTF-8 text.
+export const NOT_TEXT: Str = "the body is not UTF-8 text"
+
+/// A body that is not JSON; `<1>` is the parser's explanation.
+export const NOT_JSON: Str = "the body is not JSON: <1>"
+
+/// JSON that does not decode into the requested type; `<1>` is the decoder's explanation.
+export const NOT_DECODABLE: Str = "the body does not decode: <1>"
+
+/// A relative address without a base address; `<1>` is the address.
+export const RELATIVE_WITHOUT_BASE: Str = "'<1>' is relative and the client has no base address"
+
+/// An address that is not an absolute http or https address; `<1>` is the address.
+export const NOT_HTTP: Str = "'<1>' is not an absolute http or https address"
+
+/// A header that cannot be written; `<1>` is its name.
+export const BAD_HEADER: Str = "the header '<1>' contains a line break or an invalid name"
+
+/// A status line that does not parse; `<1>` is the line.
+export const BAD_STATUS_LINE: Str = "the status line is not a version, code, and reason: <1>"
+
+/// A head that does not parse; `<1>` is the parser's explanation.
+export const BAD_HEAD: Str = "the response head does not parse: <1>"
+
+/// A chunked body that does not parse; `<1>` is where.
+export const BAD_CHUNK: Str = "the chunked body is malformed: <1>"
+
+/// A compressed body that does not decompress; `<1>` is why.
+export const BAD_ENCODING: Str = "the compressed body does not decompress: <1>"
+
+/// A connection that stopped answering before its deadline; `<1>` is the phase.
+export const STALLED: Str = "the connection timed out while <1>"
+
+/// A builder or option that cannot be followed; `<1>` is the client name and `<2>` the problem.
+export const CLIENT_PROBLEM: Str = "client '<1>': <2>"
+
+/// A factory that cannot be built; `<1>` is every problem, separated.
+export const FACTORY_INVALID: Str = "The client factory is invalid: <1>"
+
+/// The separator between problems in one sentence.
+export const PROBLEM_SEPARATOR: Str = "; "

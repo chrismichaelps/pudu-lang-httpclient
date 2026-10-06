@@ -1,0 +1,43 @@
+/** @Examples.QuickStart.Program — a factory, a named client, and one request */
+module QuickStart
+
+import Std.Concurrent as Concurrent
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Io as Io
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient as HttpClient
+
+/// Starts a local server answering `/greeting` and answers its address.
+fn serve() -> (Server.Running, Str) {
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let server = Server.server(&Route.routing(&[Route.get("/greeting", |_request: Route.Request| Reply.text(200, "hello from pudu"))]))
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  (running, "http://127.0.0.1:" + show(Server.portOf(&running)) + "/")
+}
+
+/// Fetches a greeting through a named client and answers 0 when it arrived.
+fn main() -> Int {
+  let (running, base) = serve()
+  let factory = match Factory.build([
+      Builder.named("greeter").withBaseAddress(base).withDefaultHeader("user-agent", "quick-start/1.0").withTimeout(5000)
+    ]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let client = Factory.createClient(&factory, "greeter")
+  let greeting = Client.getText(&client, "greeting")
+  let _said = Io.writeLine(match greeting {
+      case Ok(text) => text
+      case Err(failure) => HttpClient.describe(&failure)
+    })
+  Factory.dispose(&factory)
+  let _stopped = Server.stop(&running)
+  if greeting == Ok("hello from pudu") { 0 } else { 1 }
+}

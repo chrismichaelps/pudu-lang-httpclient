@@ -1,0 +1,48 @@
+/** @HttpClient.Handler.Module — delegating handlers composed around a primary handler */
+module PuduLangHttpClient.Handler
+
+import Std.Concurrent.Cancel as Cancel
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+
+/** @HttpClient.Handler.Send — sends a request and answers its response; the primary handler's shape */
+export type Send = fn(Request.Request, Cancel.Token) -> HttpClient.Outcome[Response.Response]
+
+/** @HttpClient.Handler.Handler — one layer: sees the request, may call the rest, sees the outcome */
+export type Handler = fn(Request.Request, Cancel.Token, Send) -> HttpClient.Outcome[Response.Response]
+
+/// The handlers composed around the primary handler, the first outermost: a request passes
+/// through them in order and its response comes back through them in reverse.
+export fn compose(handlers: &Array[Handler], primary: Send) -> Send {
+  var inner = primary
+  var index = handlers.length() - 1
+  while index >= 0 {
+    inner = around(handlers[index], inner)
+    index = index - 1
+  }
+  inner
+}
+
+/// One handler made into a sender around the rest of the pipeline.
+export fn around(handler: Handler, inner: Send) -> Send {
+  fn(request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] { handler(request, token, inner) }
+}
+
+/// A handler changing every request before it is passed on.
+export fn before(step: fn(Request.Request) -> Request.Request) -> Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Send) -> HttpClient.Outcome[Response.Response] { next(step(request), token) }
+}
+
+/// A handler changing every response on its way back.
+export fn after(step: fn(Response.Response) -> Response.Response) -> Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Send) -> HttpClient.Outcome[Response.Response] {
+    let response = next(request, token) ?
+    Ok(step(response))
+  }
+}
+
+/// A handler that passes every request on unchanged.
+export fn passThrough() -> Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Send) -> HttpClient.Outcome[Response.Response] { next(request, token) }
+}

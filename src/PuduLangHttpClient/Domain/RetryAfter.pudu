@@ -1,0 +1,19 @@
+/** @Domain.RetryAfter.Module — how long a server asked the client to wait */
+module PuduLangHttpClient.Domain.RetryAfter
+
+import Std.Math as Math
+import PuduLangHttpClient.Domain.Date as Date
+
+/// The wait a `retry-after` value asks for in milliseconds at `now` milliseconds since the Unix
+/// epoch: a count of seconds, or the time until an HTTP date, never below zero; `None` when the
+/// value is neither.
+export fn delay(value: Str, now: Int) -> Option[Int] {
+  let trimmed = value.trim()
+  match trimmed.toInt() {
+    case Some(seconds) => if seconds < 0 { None } else { Some(seconds * 1000) }
+    case None => {
+      let at = Date.parse(trimmed) ?
+      Some(Math.max(at - now, 0))
+    }
+  }
+}

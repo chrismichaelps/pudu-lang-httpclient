@@ -1,0 +1,66 @@
+/** @Test.Domain.Uri.Suite — splitting, resolving, and reducing addresses */
+module PuduLangHttpClient.Domain.UriTest
+
+import Std.Char as Char
+import Std.Io as Io
+import Std.Option as Option
+import Std.Test as Test
+import Std.Text as Text
+import PuduLangHttpClient.Domain.Uri as Uri
+
+/// The base address the reference resolution examples are written against.
+const BASE: Str = "http://a/b/c/d;p?q"
+
+/// Every normal and abnormal reference example and the address it resolves to.
+const EXAMPLES: Array[(Str, Str)] = [
+  ("g:h", "g:h"), ("g", "http://a/b/c/g"), ("./g", "http://a/b/c/g"), ("g/", "http://a/b/c/g/"),
+  ("/g", "http://a/g"), ("//g", "http://g"), ("?y", "http://a/b/c/d;p?y"), ("g?y", "http://a/b/c/g?y"),
+  ("#s", "http://a/b/c/d;p?q#s"), ("g#s", "http://a/b/c/g#s"), ("g?y#s", "http://a/b/c/g?y#s"),
+  (";x", "http://a/b/c/;x"), ("g;x", "http://a/b/c/g;x"), ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+  ("", "http://a/b/c/d;p?q"), (".", "http://a/b/c/"), ("./", "http://a/b/c/"), ("..", "http://a/b/"),
+  ("../", "http://a/b/"), ("../g", "http://a/b/g"), ("../..", "http://a/"), ("../../", "http://a/"),
+  ("../../g", "http://a/g"), ("../../../g", "http://a/g"), ("../../../../g", "http://a/g"),
+  ("/./g", "http://a/g"), ("/../g", "http://a/g"), ("g.", "http://a/b/c/g."), (".g", "http://a/b/c/.g"),
+  ("g..", "http://a/b/c/g.."), ("..g", "http://a/b/c/..g"), ("./../g", "http://a/b/g"),
+  ("./g/.", "http://a/b/c/g/"), ("g/./h", "http://a/b/c/g/h"), ("g/../h", "http://a/b/c/h"),
+  ("g;x=1/./y", "http://a/b/c/g;x=1/y"), ("g;x=1/../y", "http://a/b/c/y"), ("g?y/./x", "http://a/b/c/g?y/./x"),
+  ("g?y/../x", "http://a/b/c/g?y/../x"), ("g#s/./x", "http://a/b/c/g#s/./x"), ("g#s/../x", "http://a/b/c/g#s/../x"),
+  ("http:g", "http:g")
+]
+
+/// Runs the suite.
+fn main() -> Int {
+  let resolved = EXAMPLES.filter(|pair: (Str, Str)| Uri.resolve(BASE, pair[0]) != pair[1]).map(|pair: (Str, Str)| pair[0] + " -> " + Uri.resolve(BASE, pair[0]))
+  let parts = Uri.split("https://user@example.com:8443/a/b?x=1#top")
+  let checks = Test.suite("Domain.Uri", &[
+      Test.equals("every reference example resolves as specified", &resolved, &[]),
+      Test.equals("an address splits into its five components", &parts, &Uri.Parts{scheme: Some("https"), authority: Some("user@example.com:8443"), path: "/a/b", query: Some("x=1"), fragment: Some("top")}),
+      Test.equals("an empty query is kept apart from no query", &(Uri.split("/a?").query, Uri.split("/a").query), &(Some(""), None)),
+      Test.equals("joining the components writes the address back", &Uri.join(&parts), &"https://user@example.com:8443/a/b?x=1#top"),
+      Test.that("an address with a scheme is absolute", Uri.isAbsolute("http://a/") && Uri.isAbsolute("mailto:x")),
+      Test.not("a path or a reference without a scheme is relative", Uri.isAbsolute("/a/b") || Uri.isAbsolute("a:b/c".drop(2)) || Uri.isAbsolute("1a:b")),
+      Test.equals("a base address with a trailing slash keeps its last segment", &Uri.resolve("https://api.test/v1/", "users"), &"https://api.test/v1/users"),
+      Test.equals("a base address without a trailing slash loses its last segment", &Uri.resolve("https://api.test/v1", "users"), &"https://api.test/users"),
+      Test.equals("an authority without a path merges under the root", &Uri.resolve("https://api.test", "users"), &"https://api.test/users"),
+      Test.equals("an https endpoint uses port 443 by default", &Uri.endpointOf("HTTPS://Example.COM/x"), &Some(Uri.Endpoint{scheme: "https", host: "example.com", port: 443, secure: true})),
+      Test.equals("an http endpoint reads its port and drops user information", &Uri.endpointOf("http://u:p@localhost:8080"), &Some(Uri.Endpoint{scheme: "http", host: "localhost", port: 8080, secure: false})),
+      Test.equals("an IPv6 literal loses its brackets", &Uri.endpointOf("http://[::1]:9000/"), &Some(Uri.Endpoint{scheme: "http", host: "::1", port: 9000, secure: false})),
+      Test.equals("other schemes, relative addresses, and bad ports have no endpoint", &[Uri.endpointOf("ftp://a/"), Uri.endpointOf("/a"), Uri.endpointOf("http://a:0/"), Uri.endpointOf("http://a:70000/"), Uri.endpointOf("http://a:x/"), Uri.endpointOf("http:///a")], &[None, None, None, None, None, None]),
+      Test.equals("the authority omits the scheme's own port", &(Uri.authority(&Uri.Endpoint{scheme: "http", host: "a", port: 80, secure: false}), Uri.authority(&Uri.Endpoint{scheme: "https", host: "a", port: 80, secure: true}), Uri.authority(&Uri.Endpoint{scheme: "http", host: "::1", port: 81, secure: false})), &("a", "a:80", "[::1]:81")),
+      Test.equals("an origin is the scheme and the authority", &Uri.origin(&Uri.Endpoint{scheme: "https", host: "a", port: 444, secure: true}), &"https://a:444"),
+      Test.equals("the target is the path and query, never the fragment", &(Uri.target("http://a"), Uri.target("http://a/b?c=d#e"), Uri.target("http://a?x")), &("/", "/b?c=d", "/?x")),
+      Test.equals("the fragment is dropped before sending", &Uri.withoutFragment("http://a/b#c"), &"http://a/b"),
+      Test.equals("characters a request line cannot carry are escaped as UTF-8", &Uri.escape("/a b/ñ\r\n?q=é"), &"/a%20b/%C3%B1%0D%0A?q=%C3%A9"),
+      Test.equals("a lone dot or double dot path is removed entirely", &(Uri.removeDotSegments("."), Uri.removeDotSegments("..")), &("", "")),
+      Test.equals("the delete character is escaped", &Uri.escape(Text.singleton(Option.unwrapOr(Char.fromCode(127), 'x'))), &"%7F"),
+      Test.equals("a port of 1 or 65535 is a port", &(Option.map(Uri.endpointOf("http://a:1/"), |e: Uri.Endpoint| e.port), Option.map(Uri.endpointOf("http://a:65535/"), |e: Uri.Endpoint| e.port)), &(Some(1), Some(65535))),
+      Test.that("a scheme may hold letters, digits, plus, minus, and dot", Uri.isAbsolute("svn+ssh://h") && Uri.isAbsolute("x-y:z") && Uri.isAbsolute("x.y:z") && Uri.isAbsolute("h2:z")),
+      Test.not("a scheme may hold nothing else, nor be empty or missing", Uri.isAbsolute("a_b:z") || Uri.isAbsolute("a b:z") || Uri.isAbsolute(":x") || Uri.isAbsolute("relative") || Uri.isAbsolute("")),
+      Test.equals("dot segments are removed", &(Uri.removeDotSegments("/a/b/c/./../../g"), Uri.removeDotSegments("mid/content=5/../6")), &("/a/g", "mid/6"))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

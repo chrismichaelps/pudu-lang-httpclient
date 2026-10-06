@@ -1,0 +1,87 @@
+/** @Test.Transport.Pool.Suite — leases granted, waited for, returned, and swept */
+module PuduLangHttpClient.Transport.PoolTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import Std.Io as Io
+import Std.Net as Net
+import Std.Test as Test
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Domain.Persistence as Persistence
+import PuduLangHttpClient.Transport.Pool as Pool
+import PuduLangHttpClient.Transport.Wire as Wire
+
+/// A link that is never used on the wire.
+fn link(token: Int) -> Wire.Link { Wire.Plain(Net.Connection{token: token}) }
+
+/// Whether a lease reuses a connection.
+fn isReused(lease: &Result[Pool.Lease, Wire.Fault]) -> Bool {
+  match lease {
+    case Ok(Pool.Reused(_)) => true
+    case _ => false
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let forever = Persistence.Limits{lifetime: Defaults.INFINITE, idleTimeout: Defaults.INFINITE}
+  let pool = Pool.create(forever, 2)
+  let token = Cancel.token()
+  let first = Pool.acquire(&pool, "a", &token, None)
+  let second = Pool.acquire(&pool, "a", &token, None)
+  let full = Pool.acquire(&pool, "a", &Cancel.expiring(20), Some(clock() + 20))
+  let otherOrigin = Pool.acquire(&pool, "b", &token, None)
+  Pool.release(&pool, "a", link(-1), clock(), true)
+  let reused = Pool.acquire(&pool, "a", &token, None)
+  Pool.release(&pool, "a", link(-2), clock(), false)
+  let afterClosing = Pool.statistics(&pool)
+  Pool.forfeit(&pool, "b")
+  let afterForfeit = Pool.statistics(&pool)
+
+  let waiting = Pool.create(forever, 1)
+  let _held = Pool.acquire(&waiting, "a", &token, None)
+  let _releaser = Concurrent.start(fn() -> () {
+      let _slept = Concurrent.sleep(30)
+      Pool.release(&waiting, "a", link(-3), clock(), true)
+    })
+  let waited = Pool.acquire(&waiting, "a", &Cancel.expiring(2000), Some(clock() + 2000))
+  let cancelling = Cancel.token()
+  let _cancelled = Cancel.cancel(&cancelling, "stop")
+  let refused = Pool.acquire(&waiting, "a", &cancelling, None)
+
+  let expiring = Pool.create(Persistence.Limits{lifetime: Defaults.INFINITE, idleTimeout: 0}, 4)
+  let _lease = Pool.acquire(&expiring, "a", &token, None)
+  Pool.release(&expiring, "a", link(-4), clock(), true)
+  let swept = Pool.acquire(&expiring, "a", &token, None)
+
+  let closing = Pool.create(forever, 4)
+  let _x = Pool.acquire(&closing, "a", &token, None)
+  let _y = Pool.acquire(&closing, "a", &token, None)
+  Pool.release(&closing, "a", link(-5), clock(), true)
+  Pool.close(&closing)
+  Pool.release(&closing, "a", link(-6), clock(), true)
+
+  let checks = Test.suite("Transport.Pool", &[
+      Test.equals("an empty pool grants new connections up to the limit", &(first, second), &(Ok(Pool.Fresh), Ok(Pool.Fresh))),
+      Test.equals("a full origin makes a request wait until its deadline", &full, &Err(Wire.Stalled)),
+      Test.equals("another origin has its own limit", &otherOrigin, &Ok(Pool.Fresh)),
+      Test.that("a released connection is reused", isReused(&reused)),
+      Test.equals("a connection released as not reusable is closed", &(afterClosing.closed, afterClosing.idle, afterClosing.active), &(1, 0, 2)),
+      Test.equals("a forfeited lease is not counted as opened", &(afterForfeit.opened, afterForfeit.active), &(2, 1)),
+      Test.that("a waiting request gets the connection released to it", isReused(&waited)),
+      Test.equals("a waiting request stops when its token fires", &refused, &Err(Wire.Stalled)),
+      Test.equals("an idle connection past its timeout is closed instead of reused", &(swept, Pool.statistics(&expiring).closed), &(Ok(Pool.Fresh), 1)),
+      Test.equals("closing a pool closes its idle connections and every later release", &(Pool.statistics(&closing).idle, Pool.statistics(&closing).closed, Pool.isClosed(&closing)), &(0, 2, true)),
+      Test.equals("a deadline in the past leaves no budget", &Wire.budget(Some(clock() - 1)), &None),
+      Test.equals("no deadline is an unlimited budget", &Wire.budget(None), &Some(Defaults.INFINITE)),
+      Test.that("a future deadline leaves what remains of it", match Wire.budget(Some(clock() + 10000)) {
+          case Some(left) => left > 9000 && left <= 10000
+          case None => false
+        })
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

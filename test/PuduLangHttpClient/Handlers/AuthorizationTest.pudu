@@ -1,0 +1,50 @@
+/** @Test.Handlers.Authorization.Suite — credentials added to requests, and refreshed when refused */
+module PuduLangHttpClient.Handlers.AuthorizationTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Io as Io
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Handlers.Authorization as Authorization
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+import PuduLangHttpClient.Utils.Shared as Shared
+
+/// The status a handler answers around the stub for a request.
+fn status(handler: Handler.Handler, stub: &Stub.Stub, request: Request.Request) -> Result[Int, HttpClient.Failure] {
+  Result.map(Handler.around(handler, Stub.send(stub))(request, Cancel.token()), |response: Response.Response| response.status.code)
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.when(&stub, |request: Request.Request| Request.header(&request, "authorization") == Some("Bearer fresh") || Request.header(&request, "authorization") == Some("Basic dTpw") || Request.header(&request, "authorization") == Some("Own x"), |request: Request.Request| Ok(Response.answer(&request, 200)))
+  Stub.when(&stub, |_request: Request.Request| true, |request: Request.Request| Ok(Response.answer(&request, 401)))
+  let fetched = Shared.shared([])
+  let tokens = fn(refresh: Bool) -> HttpClient.Outcome[Str] {
+    Shared.update(&fetched, |seen: Array[Bool]| seen.push(refresh))
+    Ok(if refresh { "fresh" } else { "stale" })
+  }
+  let refreshed = status(Authorization.bearer(tokens), &stub, Request.get("http://a/"))
+  let refreshes = Shared.current(&fetched)
+  let own = status(Authorization.bearer(tokens), &stub, Request.get("http://a/").withHeader("Authorization", "Own x"))
+  let failing = status(Authorization.bearer(|_refresh: Bool| HttpClient.invalid("no token")), &stub, Request.get("http://a/"))
+  let basic = status(Authorization.basic("u", "p"), &stub, Request.get("http://a/"))
+  let kept = status(Authorization.basic("u", "p"), &stub, Request.get("http://a/").withHeader("authorization", "Own x"))
+  let stillRefused = status(Authorization.bearer(|_refresh: Bool| Ok("never")), &stub, Request.get("http://a/"))
+  let checks = Test.suite("Handlers.Authorization", &[
+      Test.equals("a refused token is fetched again and the request sent once more", &(refreshed, refreshes), &(Ok(200), [false, true])),
+      Test.equals("a request carrying its own credentials is left alone", &(own, Shared.current(&fetched).length()), &(Ok(200), 2)),
+      Test.equals("a token that cannot be fetched fails the request", &failing, &Err(HttpClient.InvalidRequest("no token"))),
+      Test.equals("basic credentials are added unless the request has its own", &(basic, kept), &(Ok(200), Ok(200))),
+      Test.equals("a second refusal is answered as it is", &stillRefused, &Ok(401))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

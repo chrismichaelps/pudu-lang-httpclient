@@ -1,0 +1,61 @@
+/** @HttpClient.Events.Module — what happens to requests and pipelines, and who listens */
+module PuduLangHttpClient.Events
+
+import Std.Json as Json
+
+/** @HttpClient.Events.RequestStarted — a request entered a client's pipeline */
+export type RequestStarted = { client: Str, method: Str, uri: Str } derives Json.Encode
+
+/** @HttpClient.Events.RequestCompleted — a request left a client's pipeline with a response */
+export type RequestCompleted = { client: Str, method: Str, uri: Str, status: Int, elapsed: Int } derives Json.Encode
+
+/** @HttpClient.Events.RequestFailed — a request left a client's pipeline without a response */
+export type RequestFailed = { client: Str, method: Str, uri: Str, failure: Str, elapsed: Int } derives Json.Encode
+
+/** @HttpClient.Events.Stage — what happened to a handler pipeline */
+export type Stage = Created | Expired | Closed derives Json.Encode
+
+/** @HttpClient.Events.PipelineChanged — a client's handler pipeline was created, expired, or closed */
+export type PipelineChanged = { client: Str, generation: Int, stage: Stage } derives Json.Encode
+
+/** @HttpClient.Events.Listeners — the functions told about each kind of event, in the order added */
+export type Listeners = {
+  started: Array[fn(RequestStarted) -> ()],
+  completed: Array[fn(RequestCompleted) -> ()],
+  failed: Array[fn(RequestFailed) -> ()],
+  changed: Array[fn(PipelineChanged) -> ()]
+}
+
+/// No listeners.
+export fn listeners() -> Listeners { Listeners{started: [], completed: [], failed: [], changed: []} }
+
+/// Whether anyone listens to requests.
+export fn hearsRequests(given: &Listeners) -> Bool {
+  !given.started.isEmpty() || !given.completed.isEmpty() || !given.failed.isEmpty()
+}
+
+/** @HttpClient.Events.Listening — listeners added one at a time */
+export trait Listening {
+  /// Also tells `listen` about every request entering a pipeline.
+  fn onRequestStarted(self: &Self, listen: fn(RequestStarted) -> ()) -> Self
+  /// Also tells `listen` about every request answered with a response.
+  fn onRequestCompleted(self: &Self, listen: fn(RequestCompleted) -> ()) -> Self
+  /// Also tells `listen` about every request that failed.
+  fn onRequestFailed(self: &Self, listen: fn(RequestFailed) -> ()) -> Self
+  /// Also tells `listen` about every pipeline created, expired, or closed.
+  fn onPipelineChanged(self: &Self, listen: fn(PipelineChanged) -> ()) -> Self
+}
+
+impl Listening for Listeners {
+  /// Also tells `listen` about every request entering a pipeline.
+  fn onRequestStarted(self: &Self, listen: fn(RequestStarted) -> ()) -> Self { Listeners{..*self, started: self.started.push(listen)} }
+
+  /// Also tells `listen` about every request answered with a response.
+  fn onRequestCompleted(self: &Self, listen: fn(RequestCompleted) -> ()) -> Self { Listeners{..*self, completed: self.completed.push(listen)} }
+
+  /// Also tells `listen` about every request that failed.
+  fn onRequestFailed(self: &Self, listen: fn(RequestFailed) -> ()) -> Self { Listeners{..*self, failed: self.failed.push(listen)} }
+
+  /// Also tells `listen` about every pipeline created, expired, or closed.
+  fn onPipelineChanged(self: &Self, listen: fn(PipelineChanged) -> ()) -> Self { Listeners{..*self, changed: self.changed.push(listen)} }
+}

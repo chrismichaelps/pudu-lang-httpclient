@@ -1,0 +1,51 @@
+/** @Test.Content.Suite — message bodies and the headers describing them */
+module PuduLangHttpClient.ContentTest
+
+import Std.Io as Io
+import Std.Json as Json
+import Std.Test as Test
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+
+/** @Test.Content.Order — a body written and read as JSON through derived implementations */
+type Order = { id: Int, item: Str, gift: Option[Bool] } derives Json.Encode, Json.Decode
+
+/// Runs the suite.
+fn main() -> Int {
+  let order = Order{id: 7, item: "tea", gift: None}
+  let multipart = Content.multipartWith("b0", &[Content.field("note", "hi"), Content.file("doc", "a\"b.txt", "text/plain", &"x".toBytes())])
+  let random = Content.multipart(&[Content.field("a", "1")])
+  let checks = Test.suite("Content", &[
+      Test.equals("an empty body has no bytes and no headers", &Content.empty(), &Content.Content{payload: "".toBytes(), headers: [], stream: None}),
+      Test.equals("plain text is UTF-8 text", &Content.plain("héllo"), &Content.Content{payload: "héllo".toBytes(), headers: [("content-type", "text/plain; charset=utf-8")], stream: None}),
+      Test.equals("text gains a charset only when it names none", &(Content.text("<p/>", "text/html").headers, Content.text("x", "text/csv; charset=latin1").headers), &([("content-type", "text/html; charset=utf-8")], [("content-type", "text/csv; charset=latin1")])),
+      Test.equals("bytes keep their media type", &(Content.bytes(&"ab".toBytes(), "image/png").headers, Content.octets(&"ab".toBytes()).headers), &([("content-type", "image/png")], [("content-type", "application/octet-stream")])),
+      Test.equals("a derived value is written as JSON", &Content.readText(&Content.jsonOf(&order)), &Ok("\{\"id\":7,\"item\":\"tea\",\"gift\":null\}")),
+      Test.equals("JSON reads back into a derived value", &Content.readAs(&Content.jsonOf(&order)), &Ok(order)),
+      Test.equals("a form is url-encoded", &Content.readText(&Content.form(&[("q", "a b"), ("x", "1&2")])), &Ok("q=a+b&x=1%262")),
+      Test.equals("a form reads back into fields", &Content.readForm(&Content.form(&[("q", "a b"), ("x", "1&2")])), &Ok([("q", "a b"), ("x", "1&2")])),
+      Test.equals("a multipart body frames each part", &Content.readText(&multipart), &Ok("--b0\r\ncontent-disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--b0\r\ncontent-disposition: form-data; name=\"doc\"; filename=\"a\\\"b.txt\"\r\ncontent-type: text/plain\r\n\r\nx\r\n--b0--\r\n")),
+      Test.equals("a multipart body names its boundary", &Content.mediaTypeOf(&multipart), &Some("multipart/form-data")),
+      Test.that("a random boundary is used when none is given", match random.headers {
+          case [(_, value)] => value.startsWith("multipart/form-data; boundary=pudu-")
+          case _ => false
+        }),
+      Test.equals("a header is set once", &Content.withHeader(&Content.plain("x"), "Content-Type", "text/csv").headers, &[("Content-Type", "text/csv")]),
+      Test.that("a streamed body holds a producer and no bytes", Content.isStreamed(&Content.streamed("text/csv", || None)) && Content.streamed("text/csv", || None).payload.isEmpty() && !Content.isStreamed(&Content.plain("x"))),
+      Test.equals("the length counts bytes", &Content.length(&Content.plain("é")), &2),
+      Test.equals("bytes that are not text are unreadable as text", &Content.readText(&Content.octets(&"é".toBytes().take(1))), &Err(HttpClient.Unreadable("the body is not UTF-8 text"))),
+      Test.that("text that is not JSON is unreadable as JSON", match Content.readJson(&Content.plain("\{nope")) {
+          case Err(HttpClient.Unreadable(reason)) => reason.startsWith("the body is not JSON: ")
+          case _ => false
+        }),
+      Test.that("JSON of another shape is unreadable as the type", match Content.readAs[Order](&Content.plain("\{\"id\":\"x\"\}")) {
+          case Err(HttpClient.Unreadable(reason)) => reason.startsWith("the body does not decode: ")
+          case _ => false
+        })
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

@@ -1,0 +1,73 @@
+/** @Examples.Handlers.Program — delegating handlers, logging, metrics, and event listeners */
+module Handlers
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Io as Io
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Handlers.Logging as Logging
+import PuduLangHttpClient.Handlers.Metrics as Metrics
+import PuduLangHttpClient.Handlers.Propagation as Propagation
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangLog.Configuration as Configuration
+import PuduLangLog as Log
+import PuduLangLog.Sinks.Console as Console
+
+/// A handler stamping every request with an identifier and timing its response.
+fn stamping(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+  let began = clock()
+  let response = next(request.setHeader("x-request-id", "req-" + show(began)), token) ?
+  Ok(response.withHeader("x-client-elapsed", show(clock() - began)))
+}
+
+/// Starts a local server echoing the request identifier and answers its address.
+fn serve() -> (Server.Running, Str) {
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let server = Server.server(&Route.routing(&[Route.get("/whoami", |request: Route.Request| Reply.text(200, match Route.header(&request, "x-correlation-id") {
+              case Some(found) => found
+              case None => "nobody"
+            }))]))
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  (running, "http://127.0.0.1:" + show(Server.portOf(&running)) + "/")
+}
+
+/// Sends requests through a pipeline of handlers, answering 0 when every layer did its part.
+fn main() -> Int {
+  let (running, base) = serve()
+  let logger = Configuration.create().minimumLevel(Log.Information).writeTo(Console.sink(Console.defaults())).createLogger()
+  let meter = Metrics.meter()
+  let incoming = || [("x-correlation-id", "order-1234")]
+  let options = Factory.Options{listeners: Events.listeners().onRequestCompleted(fn(event: Events.RequestCompleted) -> () {
+        let _said = Io.writeLine("completed " + event.client + " " + event.uri + " with " + show(event.status))
+      }) }
+  let factory = match Factory.buildWith(&options, [
+      Builder.defaults().observedBy(Logging.observer(logger)).withHandler(Metrics.handler(&meter)),
+      Builder.named("api").withBaseAddress(base).withHandler(stamping).withHandler(Propagation.handler(&["x-correlation-id"], incoming))
+    ]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let client = Factory.createClient(&factory, "api")
+  let answered = Client.getText(&client, "whoami")
+  let response = Client.get(&client, "whoami")
+  let stamped = match response {
+    case Ok(found) => Response.header(&found, "x-client-elapsed") != None
+    case Err(_) => false
+  }
+  let snapshot = Metrics.snapshot(&meter)
+  Factory.dispose(&factory)
+  let _stopped = Server.stop(&running)
+  if answered == Ok("order-1234") && stamped && snapshot.successful == 2 { 0 } else { 1 }
+}

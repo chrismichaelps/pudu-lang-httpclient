@@ -1,0 +1,32 @@
+/** @Test.Domain.Redirect.Suite — which redirects are followed, and how the request changes */
+module PuduLangHttpClient.Domain.RedirectTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Domain.Redirect as Redirect
+
+/// Runs the suite.
+fn main() -> Int {
+  let from = "https://a.test/x/y?q#f"
+  let checks = Test.suite("Domain.Redirect", &[
+      Test.equals("every redirect status is one and no other", &[200, 299, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309].filter(|code: Int| Redirect.isRedirect(code)), &[300, 301, 302, 303, 307, 308]),
+      Test.equals("a relative location resolves against the request and drops its fragment", &Redirect.next(&Http.Get, 302, from, "z#frag"), &Some(Redirect.Hop{method: Http.Get, uri: "https://a.test/x/z", keepsBody: true, keepsCredentials: true})),
+      Test.equals("a see-other turns a put into a get without a body", &Redirect.next(&Http.Put, 303, from, "/done"), &Some(Redirect.Hop{method: Http.Get, uri: "https://a.test/done", keepsBody: false, keepsCredentials: true})),
+      Test.equals("a see-other keeps a head", &Redirect.next(&Http.Head, 303, from, "/done"), &Some(Redirect.Hop{method: Http.Head, uri: "https://a.test/done", keepsBody: true, keepsCredentials: true})),
+      Test.equals("a moved, found, or multiple-choices turns a post into a get", &[300, 301, 302].map(|code: Int| Redirect.next(&Http.Post, code, from, "/n")), &[300, 301, 302].map(|_c: Int| Some(Redirect.Hop{method: Http.Get, uri: "https://a.test/n", keepsBody: false, keepsCredentials: true}))),
+      Test.equals("a moved or found keeps a put", &Redirect.next(&Http.Put, 301, from, "/n"), &Some(Redirect.Hop{method: Http.Put, uri: "https://a.test/n", keepsBody: true, keepsCredentials: true})),
+      Test.equals("a temporary or permanent redirect keeps a post and its body", &[307, 308].map(|code: Int| Redirect.next(&Http.Post, code, from, "/n")), &[307, 308].map(|_c: Int| Some(Redirect.Hop{method: Http.Post, uri: "https://a.test/n", keepsBody: true, keepsCredentials: true}))),
+      Test.equals("another origin loses the credentials", &Redirect.next(&Http.Get, 302, from, "https://b.test/"), &Some(Redirect.Hop{method: Http.Get, uri: "https://b.test/", keepsBody: true, keepsCredentials: false})),
+      Test.equals("another port is another origin", &Redirect.next(&Http.Get, 302, "http://a.test/", "http://a.test:81/"), &Some(Redirect.Hop{method: Http.Get, uri: "http://a.test:81/", keepsBody: true, keepsCredentials: false})),
+      Test.equals("plain to secured is followed", &Redirect.next(&Http.Get, 301, "http://a.test/", "https://a.test/"), &Some(Redirect.Hop{method: Http.Get, uri: "https://a.test/", keepsBody: true, keepsCredentials: false})),
+      Test.equals("secured to plain is not followed", &Redirect.next(&Http.Get, 301, from, "http://a.test/"), &None),
+      Test.equals("a location with spaces is escaped", &Redirect.next(&Http.Get, 302, from, " /a b "), &Some(Redirect.Hop{method: Http.Get, uri: "https://a.test/a%20b", keepsBody: true, keepsCredentials: true})),
+      Test.equals("an empty location, another scheme, or a status that does not redirect is not followed", &[Redirect.next(&Http.Get, 302, from, "  "), Redirect.next(&Http.Get, 302, from, "ftp://a/"), Redirect.next(&Http.Get, 304, from, "/x"), Redirect.next(&Http.Get, 302, "/relative", "/x")], &[None, None, None, None])
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

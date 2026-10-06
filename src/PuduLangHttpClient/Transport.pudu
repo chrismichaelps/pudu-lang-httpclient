@@ -1,0 +1,365 @@
+/** @HttpClient.Transport.Module — the primary handler: pooled keep-alive connections on the wire */
+module PuduLangHttpClient.Transport
+
+import Std.Compress.Gzip as Gzip
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Http.Safe as Safe
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Cookies as Cookies
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Domain.Persistence as Persistence
+import PuduLangHttpClient.Domain.Redirect as Redirect
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Options as RequestOptions
+import PuduLangHttpClient.Proxy as Proxy
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport.Connect as Connect
+import PuduLangHttpClient.Transport.Exchange as Exchange
+import PuduLangHttpClient.Transport.Hop as Hop
+import PuduLangHttpClient.Transport.Pool as Pool
+import PuduLangHttpClient.Transport.Wire as Wire
+import PuduLangHttpClient.Transport.Writer as Writer
+import PuduLangHttpClient.Utils.Template as Template
+
+/** @HttpClient.Transport.AddressPolicy — which hosts requests may reach */
+export type AddressPolicy = AnyAddress | PublicOnly(Array[Str])
+
+/** @HttpClient.Transport.Options — how connections are kept, and what a response may cost */
+export type Options = {
+  pooledConnectionLifetime: Int,
+  pooledConnectionIdleTimeout: Int,
+  maxConnectionsPerServer: Int,
+  connectTimeout: Int,
+  allowAutoRedirect: Bool,
+  maxAutomaticRedirections: Int,
+  automaticDecompression: Bool,
+  useCookies: Bool,
+  cookies: Option[Cookies.Jar],
+  proxy: Option[Proxy.Proxy],
+  addressPolicy: AddressPolicy,
+  maxResponseHeadersLength: Int,
+  maxResponseContentLength: Int
+}
+
+/** @HttpClient.Transport.Transport — the options and the pool of one primary handler */
+export type Transport = { options: Options, pool: Pool.Pool, jar: Option[Cookies.Jar] }
+
+/// Connections kept until idle for a minute, no per-server limit, redirects followed up to 50 times,
+/// no decompression, no cookies, no proxy, any host, and a 64 MiB body.
+export fn defaults() -> Options {
+  Options {
+    pooledConnectionLifetime: Defaults.POOLED_LIFETIME,
+    pooledConnectionIdleTimeout: Defaults.POOLED_IDLE_TIMEOUT,
+    maxConnectionsPerServer: Defaults.MAX_CONNECTIONS_PER_SERVER,
+    connectTimeout: Defaults.CONNECT_TIMEOUT,
+    allowAutoRedirect: true,
+    maxAutomaticRedirections: Defaults.MAX_REDIRECTS,
+    automaticDecompression: false,
+    useCookies: false,
+    cookies: None,
+    proxy: None,
+    addressPolicy: AnyAddress,
+    maxResponseHeadersLength: Defaults.MAX_RESPONSE_HEADERS,
+    maxResponseContentLength: Defaults.MAX_RESPONSE_BUFFER
+  }
+}
+
+/// Every reason the options cannot be followed.
+export fn validate(options: &Options) -> Array[Str] {
+  var problems: Array[Str] = []
+  if !isDuration(options.pooledConnectionLifetime) { problems = problems.push("pooledConnectionLifetime must be at least 0 ms or INFINITE") }
+  if !isDuration(options.pooledConnectionIdleTimeout) { problems = problems.push("pooledConnectionIdleTimeout must be at least 0 ms or INFINITE") }
+  if !isDuration(options.connectTimeout) || options.connectTimeout == 0 { problems = problems.push("connectTimeout must be positive or INFINITE") }
+  if options.maxConnectionsPerServer < 1 { problems = problems.push("maxConnectionsPerServer must be at least 1") }
+  if options.maxAutomaticRedirections < 1 { problems = problems.push("maxAutomaticRedirections must be at least 1") }
+  if options.maxResponseHeadersLength < 1 { problems = problems.push("maxResponseHeadersLength must be at least 1") }
+  if options.maxResponseContentLength < 0 { problems = problems.push("maxResponseContentLength must be at least 0") }
+  match options.proxy {
+    case Some(proxy) => problems.concat(Proxy.validate(&proxy))
+    case None => problems
+  }
+}
+
+/// A transport following the options, with its own empty pool and, when cookies are used without a
+/// jar, its own jar.
+export fn create(options: Options) -> Transport {
+  let limits = Persistence.Limits{lifetime: options.pooledConnectionLifetime, idleTimeout: options.pooledConnectionIdleTimeout}
+  let jar = match options.cookies {
+    case Some(given) => Some(given)
+    case None => if options.useCookies { Some(Cookies.jar()) } else { None }
+  }
+  Transport{options: options, pool: Pool.create(limits, options.maxConnectionsPerServer), jar: jar}
+}
+
+/// The transport as the primary handler of a pipeline.
+export fn send(transport: &Transport) -> Handler.Send {
+  let held = *transport
+  fn(request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] { sendOn(&held, request, &token) }
+}
+
+/// The key a client sets to cap how many body bytes the transport buffers for one request.
+export fn bufferLimit() -> RequestOptions.Key[Int] { RequestOptions.intKey("pudu.httpclient.buffer-limit") }
+
+/// The connections opened, reused, closed, in use, and idle so far.
+export fn statistics(transport: &Transport) -> Pool.Statistics { Pool.statistics(&transport.pool) }
+
+/// The jar the transport stores cookies in, when it uses cookies.
+export fn cookies(transport: &Transport) -> Option[Cookies.Jar] { transport.jar }
+
+/// Closes every idle connection and stops keeping new ones; requests still in flight finish and
+/// requests sent later open connections they close afterwards.
+export fn close(transport: &Transport) -> () { Pool.close(&transport.pool) }
+
+/// Whether the transport has been closed.
+export fn isClosed(transport: &Transport) -> Bool { Pool.isClosed(&transport.pool) }
+
+/** @HttpClient.Transport.Configuring — transport options changed one decision at a time */
+export trait Configuring {
+  /// The options closing a pooled connection once it has lived this many milliseconds.
+  fn withPooledConnectionLifetime(self: &Self, millis: Int) -> Self
+  /// The options closing a pooled connection once it has sat unused this many milliseconds.
+  fn withPooledConnectionIdleTimeout(self: &Self, millis: Int) -> Self
+  /// The options holding at most this many connections open to one origin.
+  fn withMaxConnectionsPerServer(self: &Self, count: Int) -> Self
+  /// The options giving up on opening a connection after this many milliseconds.
+  fn withConnectTimeout(self: &Self, millis: Int) -> Self
+  /// The options answering redirects instead of following them.
+  fn withoutRedirects(self: &Self) -> Self
+  /// The options following at most this many redirects.
+  fn withMaxRedirects(self: &Self, count: Int) -> Self
+  /// The options asking for gzip and decompressing buffered bodies.
+  fn withDecompression(self: &Self) -> Self
+  /// The options storing and sending cookies in a jar of the transport's own.
+  fn usingCookies(self: &Self) -> Self
+  /// The options storing and sending cookies in a jar shared with others.
+  fn withCookies(self: &Self, jar: Cookies.Jar) -> Self
+  /// The options sending requests through a proxy.
+  fn withProxy(self: &Self, proxy: Proxy.Proxy) -> Self
+  /// The options limiting which hosts requests may reach.
+  fn withAddressPolicy(self: &Self, policy: AddressPolicy) -> Self
+  /// The options refusing a response head longer than this many bytes.
+  fn withMaxResponseHeadersLength(self: &Self, bytes: Int) -> Self
+  /// The options refusing to buffer more than this many body bytes when the request sets no limit.
+  fn withMaxResponseContentLength(self: &Self, bytes: Int) -> Self
+}
+
+impl Configuring for Options {
+  /// The options closing a pooled connection once it has lived this many milliseconds.
+  fn withPooledConnectionLifetime(self: &Self, millis: Int) -> Self { Options{..*self, pooledConnectionLifetime: millis} }
+
+  /// The options closing a pooled connection once it has sat unused this many milliseconds.
+  fn withPooledConnectionIdleTimeout(self: &Self, millis: Int) -> Self { Options{..*self, pooledConnectionIdleTimeout: millis} }
+
+  /// The options holding at most this many connections open to one origin.
+  fn withMaxConnectionsPerServer(self: &Self, count: Int) -> Self { Options{..*self, maxConnectionsPerServer: count} }
+
+  /// The options giving up on opening a connection after this many milliseconds.
+  fn withConnectTimeout(self: &Self, millis: Int) -> Self { Options{..*self, connectTimeout: millis} }
+
+  /// The options answering redirects instead of following them.
+  fn withoutRedirects(self: &Self) -> Self { Options{..*self, allowAutoRedirect: false} }
+
+  /// The options following at most this many redirects.
+  fn withMaxRedirects(self: &Self, count: Int) -> Self { Options{..*self, allowAutoRedirect: true, maxAutomaticRedirections: count} }
+
+  /// The options asking for gzip and decompressing buffered bodies.
+  fn withDecompression(self: &Self) -> Self { Options{..*self, automaticDecompression: true} }
+
+  /// The options storing and sending cookies in a jar of the transport's own.
+  fn usingCookies(self: &Self) -> Self { Options{..*self, useCookies: true} }
+
+  /// The options storing and sending cookies in a jar shared with others.
+  fn withCookies(self: &Self, jar: Cookies.Jar) -> Self { Options{..*self, useCookies: true, cookies: Some(jar)} }
+
+  /// The options sending requests through a proxy.
+  fn withProxy(self: &Self, proxy: Proxy.Proxy) -> Self { Options{..*self, proxy: Some(proxy)} }
+
+  /// The options limiting which hosts requests may reach.
+  fn withAddressPolicy(self: &Self, policy: AddressPolicy) -> Self { Options{..*self, addressPolicy: policy} }
+
+  /// The options refusing a response head longer than this many bytes.
+  fn withMaxResponseHeadersLength(self: &Self, bytes: Int) -> Self { Options{..*self, maxResponseHeadersLength: bytes} }
+
+  /// The options refusing to buffer more than this many body bytes when the request sets no limit.
+  fn withMaxResponseContentLength(self: &Self, bytes: Int) -> Self { Options{..*self, maxResponseContentLength: bytes} }
+}
+
+/// The response to a request, following redirects.
+fn sendOn(transport: &Transport, request: Request.Request, token: &Cancel.Token) -> HttpClient.Outcome[Response.Response] {
+  let started = clock()
+  let deadline = match Cancel.remaining(token) {
+    case Some(left) => Some(started + left)
+    case None => None
+  }
+  let version = match Version.negotiate(&request.version, &request.versionPolicy) {
+    case Some(found) => found
+    case None => { return Err(HttpClient.VersionUnsupported(Http.versionName(&request.version))) }
+  }
+  if let Some(name) = Headers.unwritable(&request.headers) { return HttpClient.invalid(Template.fill(Messages.BAD_HEADER, &[name])) }
+  let limit = match Request.option(&request, &bufferLimit()) {
+    case Some(given) => given
+    case None => transport.options.maxResponseContentLength
+  }
+  let reading = Exchange.Reading{headersLimit: transport.options.maxResponseHeadersLength, bodyLimit: limit}
+  var current = request
+  var hops = 0
+  loop {
+    if let Err(why) = Cancel.check(token) { return Err(interrupted(&why, started)) }
+    let endpoint = match Uri.endpointOf(current.uri) {
+      case Some(found) => found
+      case None => { return HttpClient.invalid(Template.fill(Messages.NOT_HTTP, &[current.uri])) }
+    }
+    if let PublicOnly(permitted) = transport.options.addressPolicy {
+      if let Err(problem) = Safe.outboundHost(endpoint.host, &permitted) { return Err(HttpClient.NotPermitted(Safe.explain(&problem))) }
+    }
+    let prepared = prepare(transport, &current)
+    let route = Connect.routeTo(&endpoint, &transport.options.proxy)
+    let extra = if Connect.isProxied(&route) { proxyHeaders(&transport.options.proxy) } else { [] }
+    let form = if Connect.isProxied(&route) { Writer.AbsoluteForm } else { Writer.OriginForm }
+    let sending = Hop.Sending {
+      written: Writer.render(&prepared, &version, &endpoint, &form, &extra),
+      method: prepared.method,
+      headers: prepared.headers,
+      reading: reading,
+      connectTimeout: transport.options.connectTimeout,
+      deadline: deadline,
+      receiver: prepared.receiver,
+      following: transport.options.allowAutoRedirect,
+      upload: streamOf(&prepared)
+    }
+    let exchanged = match Hop.send(&transport.pool, &route, &sending, token) {
+      case Ok(found) => found
+      case Err(fault) => { return Err(failureOf(&fault, token, started)) }
+    }
+    let response = responseOf(&exchanged, &current)
+    if let Some(jar) = transport.jar { Cookies.store(&jar, current.uri, &Headers.values(&exchanged.head.headers, "set-cookie")) }
+    let hop = if transport.options.allowAutoRedirect {
+      match Response.header(&response, "location") {
+        case Some(location) => replayable(&current, Redirect.next(&current.method, response.status.code, current.uri, location))
+        case None => None
+      }
+    } else { None }
+    match hop {
+      case Some(next) => {
+        hops = hops + 1
+        if hops > transport.options.maxAutomaticRedirections { return Err(HttpClient.TooManyRedirects(transport.options.maxAutomaticRedirections)) }
+        current = followed(&current, &next)
+      }
+      case None => { return decoded(transport, response, limit) }
+    }
+  }
+}
+
+/// The request as it goes on the wire: with the jar's cookies, and asking for gzip when the
+/// transport decompresses a buffered body.
+fn prepare(transport: &Transport, request: &Request.Request) -> Request.Request {
+  var headers = request.headers
+  if let Some(jar) = transport.jar {
+    if let Some(cookie) = Cookies.header(&jar, request.uri) { headers = Headers.set(&headers, "cookie", cookie) }
+  }
+  if transport.options.automaticDecompression && request.receiver == None && !Headers.has(&headers, "accept-encoding") {
+    headers = Headers.add(&headers, "accept-encoding", "gzip")
+  }
+  Request.Request{..*request, headers: headers}
+}
+
+/// The producer of a streamed body, when the request has one.
+fn streamOf(request: &Request.Request) -> Option[Content.Producer] {
+  let content = request.content ?
+  content.stream
+}
+
+/// The redirect hop, unless it would send a streamed body that was already sent.
+fn replayable(request: &Request.Request, hop: Option[Redirect.Hop]) -> Option[Redirect.Hop] {
+  let next = hop ?
+  if next.keepsBody && streamOf(request) != None { None } else { Some(next) }
+}
+
+/// The `proxy-authorization` header a plain proxy needs, when it has credentials.
+fn proxyHeaders(proxy: &Option[Proxy.Proxy]) -> Array[(Str, Str)] {
+  match proxy {
+    case Some(found) => {
+      match Proxy.authorization(&found) {
+        case Some(value) => [("proxy-authorization", value)]
+        case None => []
+      }
+    }
+    case None => []
+  }
+}
+
+/// The response an exchange read, with its content headers kept apart.
+fn responseOf(exchanged: &Exchange.Exchanged, request: &Request.Request) -> Response.Response {
+  let (own, described) = Headers.splitContent(&exchanged.head.headers)
+  Response.Response {
+    status: exchanged.head.status,
+    version: Http.versionFrom(exchanged.head.version),
+    headers: own,
+    content: Content.Content{payload: exchanged.body, headers: described, stream: None},
+    trailers: exchanged.trailers,
+    request: *request
+  }
+}
+
+/// The request a followed redirect sends: the new method and address, the body only when the method
+/// kept it, and credentials only within one origin.
+fn followed(request: &Request.Request, hop: &Redirect.Hop) -> Request.Request {
+  let kept = if hop.keepsCredentials { request.headers } else { Headers.removeAll(&request.headers, &#{"authorization", "cookie", "proxy-authorization"}) }
+  Request.Request {
+    ..*request,
+    method: hop.method,
+    uri: hop.uri,
+    headers: Headers.remove(&kept, "cookie"),
+    content: if hop.keepsBody { request.content } else { None }
+  }
+}
+
+/// The response with a gzip body decompressed, when the transport decompresses.
+fn decoded(transport: &Transport, response: Response.Response, limit: Int) -> HttpClient.Outcome[Response.Response] {
+  let encoding = match Headers.get(&response.content.headers, "content-encoding") {
+    case Some(found) => found
+    case None => { return Ok(response) }
+  }
+  let applies = transport.options.automaticDecompression && response.request.receiver == None && Headers.lists(encoding, "gzip")
+  if !applies || response.content.payload.isEmpty() { return Ok(response) }
+  match Gzip.decompressWithin(&response.content.payload, limit) {
+    case Ok(payload) => {
+      let headers = Headers.removeAll(&response.content.headers, &#{"content-encoding", "content-length"})
+      Ok(Response.Response{..response, content: Content.Content{payload: payload, headers: headers, stream: None}})
+    }
+    case Err(Gzip.OutputLimitExceeded(_)) => Err(HttpClient.ContentTooLarge(limit))
+    case Err(problem) => Err(HttpClient.Protocol(Template.fill(Messages.BAD_ENCODING, &[show(problem)])))
+  }
+}
+
+/// The failure a wire fault stands for.
+fn failureOf(fault: &Wire.Fault, token: &Cancel.Token, started: Int) -> HttpClient.Failure {
+  match fault {
+    case Wire.Stalled => {
+      match Cancel.reason(token) {
+        case Some(why) => interrupted(&why, started)
+        case None => HttpClient.TimedOut(clock() - started)
+      }
+    }
+    case Wire.Ended => HttpClient.ResponseEnded
+    case Wire.Broken(failure) => failure
+  }
+}
+
+/// The failure a fired token stands for: a cancellation, or a timeout after the time spent.
+fn interrupted(why: &Cancel.Reason, started: Int) -> HttpClient.Failure {
+  match why {
+    case Cancel.Requested(reason) => HttpClient.Cancelled(reason)
+    case Cancel.DeadlineExceeded => HttpClient.TimedOut(clock() - started)
+  }
+}
+
+/// Whether milliseconds name a duration: at least zero, or `Defaults.INFINITE`.
+fn isDuration(millis: Int) -> Bool { millis >= 0 || millis == Defaults.INFINITE }

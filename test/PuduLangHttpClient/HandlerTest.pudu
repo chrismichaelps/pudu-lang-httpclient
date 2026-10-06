@@ -1,0 +1,46 @@
+/** @Test.Handler.Suite — delegating handlers composed around a primary handler */
+module PuduLangHttpClient.HandlerTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Io as Io
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+
+/// A handler recording its name on the way in and on the way out.
+fn tracing(name: Str) -> Handler.Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    let inbound = request.withHeader("trace", name)
+    let response = next(inbound, token) ?
+    Ok(response.withHeader("trace", name))
+  }
+}
+
+/// A primary handler echoing the request's trace into its response.
+fn echo(request: Request.Request, _token: Cancel.Token) -> HttpClient.Outcome[Response.Response] {
+  Ok(Response.answer(&request, 200).withText(request.headers.map(|pair: (Str, Str)| pair[1]).join(">")))
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let send = Handler.compose(&[tracing("outer"), tracing("middle"), tracing("inner")], echo)
+  let outcome = send(Request.get("http://a/"), Cancel.token())
+  let refusing = Handler.compose(&[fn(request: Request.Request, _token: Cancel.Token, _next: Handler.Send) -> HttpClient.Outcome[Response.Response] { HttpClient.invalid("refused") }, tracing("never")], echo)
+  let changed = Handler.compose(&[Handler.before(|request: Request.Request| request.withHeader("x", "before")), Handler.after(|response: Response.Response| response.withHeader("after", "yes")), Handler.passThrough()], echo)(Request.get("http://a/"), Cancel.token())
+  let checks = Test.suite("Handler", &[
+      Test.equals("a request passes through the handlers in order", &Result.map(outcome, |r: Response.Response| Result.unwrapOr(Response.text(&r), "")), &Ok("outer>middle>inner")),
+      Test.equals("a response comes back through them in reverse", &Result.map(outcome, |r: Response.Response| Response.headerValues(&r, "trace")), &Ok(["inner", "middle", "outer"])),
+      Test.equals("a handler may answer without calling the rest", &Result.map(refusing(Request.get("http://a/"), Cancel.token()), |r: Response.Response| r.status.code), &Err(HttpClient.InvalidRequest("refused"))),
+      Test.equals("no handlers leave the primary handler alone", &Result.map(Handler.compose(&[], echo)(Request.get("http://a/"), Cancel.token()), |r: Response.Response| r.status.code), &Ok(200)),
+      Test.equals("before and after change the request and the response", &Result.map(changed, |r: Response.Response| (Result.unwrapOr(Response.text(&r), ""), Response.header(&r, "after"))), &Ok(("before", Some("yes")))),
+      Test.equals("around makes one handler a sender", &Result.map(Handler.around(tracing("only"), echo)(Request.get("http://a/"), Cancel.token()), |r: Response.Response| Result.unwrapOr(Response.text(&r), "")), &Ok("only"))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

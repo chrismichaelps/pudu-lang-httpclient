@@ -1,0 +1,136 @@
+/** @Transport.Pool.Module — idle connections kept per origin and handed out again */
+module PuduLangHttpClient.Transport.Pool
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Json as Json
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Domain.Persistence as Persistence
+import PuduLangHttpClient.Transport.Wire as Wire
+import PuduLangHttpClient.Utils.Shared as Shared
+
+/** @Transport.Pool.Statistics — connections opened, reused, closed, in use, and idle so far */
+export type Statistics = { opened: Int, reused: Int, closed: Int, active: Int, idle: Int } derives Json.Encode
+
+/** @Transport.Pool.Lease — a pooled connection to reuse, or permission to open a new one */
+export type Lease = Reused(Persistence.Idle[Wire.Link]) | Fresh
+
+/** @Transport.Pool.Slot — one origin's idle connections and how many it holds open */
+type Slot = { idle: Array[Persistence.Idle[Wire.Link]], open: Int }
+
+/** @Transport.Pool.State — every origin's slot, whether the pool is closed, and its counters */
+type State = { slots: Map[Str, Slot], closed: Bool, counts: Statistics }
+
+/** @Transport.Pool.Pool — the shared state and the limits it keeps */
+export type Pool = { state: Shared.Shared[State], limits: Persistence.Limits, maxPerServer: Int }
+
+/// An empty pool keeping connections within the limits, at most `maxPerServer` open per origin.
+export fn create(limits: Persistence.Limits, maxPerServer: Int) -> Pool {
+  let counts = Statistics{opened: 0, reused: 0, closed: 0, active: 0, idle: 0}
+  Pool{state: Shared.shared(State{slots: mapOf([]), closed: false, counts: counts}), limits: limits, maxPerServer: maxPerServer}
+}
+
+/// A lease for one request to the origin `key`, waiting while the origin is at its limit until a
+/// connection is released, the token fires, or the deadline passes.
+export fn acquire(pool: &Pool, key: Str, token: &Cancel.Token, deadline: Option[Int]) -> Result[Lease, Wire.Fault] {
+  loop {
+    let now = clock()
+    let (granted, stale) = Shared.change(&pool.state, |state: State| grant(&state, key, &pool.limits, pool.maxPerServer, now))
+    for one in stale { Wire.close(&one.link) }
+    match granted {
+      case Some(lease) => { return Ok(lease) }
+      case None => {
+        if Wire.budget(deadline) == None { return Err(Wire.Stalled) }
+        if let Err(_) = Cancel.pause(token, Defaults.POOL_WAIT_SLICE) { return Err(Wire.Stalled) }
+      }
+    }
+  }
+}
+
+/// Returns a connection after its exchange: kept idle when it is reusable and the pool is open,
+/// closed otherwise.
+export fn release(pool: &Pool, key: Str, link: Wire.Link, created: Int, reusable: Bool) -> () {
+  let now = clock()
+  let kept = Shared.change(&pool.state, fn(state: State) -> (State, Bool) {
+      let slot = slotOf(&state, key)
+      let counts = Statistics{..state.counts, active: state.counts.active - 1}
+      if reusable && !state.closed {
+        let idle = Persistence.Idle{link: link, created: created, lastUsed: now}
+        (State{..state, slots: state.slots.insert(key, Slot{..slot, idle: slot.idle.push(idle)}), counts: counts}, true)
+      } else {
+        (State{..state, slots: state.slots.insert(key, Slot{..slot, open: slot.open - 1}), counts: Statistics{..counts, closed: counts.closed + 1}}, false)
+      }
+    })
+  if !kept { Wire.close(&link) }
+}
+
+/// Gives back permission to open a connection that could not be opened.
+export fn forfeit(pool: &Pool, key: Str) -> () {
+  Shared.update(&pool.state, fn(state: State) -> State {
+      let slot = slotOf(&state, key)
+      State{..state, slots: state.slots.insert(key, Slot{..slot, open: slot.open - 1}), counts: Statistics{..state.counts, opened: state.counts.opened - 1, active: state.counts.active - 1}}
+    })
+}
+
+/// The counters as they stand, with the idle connections counted now.
+export fn statistics(pool: &Pool) -> Statistics {
+  let state = Shared.current(&pool.state)
+  var idle = 0
+  for slot in state.slots.values() { idle = idle + slot.idle.length() }
+  Statistics{..state.counts, idle: idle}
+}
+
+/// Closes every idle connection and stops keeping connections: one released later is closed.
+export fn close(pool: &Pool) -> () {
+  let idle = Shared.change(&pool.state, fn(state: State) -> (State, Array[Persistence.Idle[Wire.Link]]) {
+      var dropped: Array[Persistence.Idle[Wire.Link]] = []
+      var slots: Map[Str, Slot] = mapOf([])
+      for (key, slot) in state.slots.entries() {
+        dropped = dropped.concat(slot.idle)
+        slots = slots.insert(key, Slot{idle: [], open: slot.open - slot.idle.length()})
+      }
+      (State{slots: slots, closed: true, counts: Statistics{..state.counts, closed: state.counts.closed + dropped.length()}}, dropped)
+    })
+  for one in idle { Wire.close(&one.link) }
+}
+
+/// Whether the pool has been closed.
+export fn isClosed(pool: &Pool) -> Bool { Shared.current(&pool.state).closed }
+
+/// The state after sweeping every origin's idle connections and granting a lease for `key` when one
+/// is available, with the lease and the connections swept out.
+fn grant(state: &State, key: Str, limits: &Persistence.Limits, maxPerServer: Int, now: Int) -> (State, (Option[Lease], Array[Persistence.Idle[Wire.Link]])) {
+  var stale: Array[Persistence.Idle[Wire.Link]] = []
+  var slots: Map[Str, Slot] = mapOf([])
+  for (name, slot) in state.slots.entries() {
+    let (usable, expired) = Persistence.sweep(&slot.idle, limits, now)
+    stale = stale.concat(expired)
+    slots = slots.insert(name, Slot{idle: usable, open: slot.open - expired.length()})
+  }
+  let counts = Statistics{..state.counts, closed: state.counts.closed + stale.length()}
+  let slot = match slots.get(key) {
+    case Some(found) => found
+    case None => Slot{idle: [], open: 0}
+  }
+  match slot.idle {
+    case [..rest, last] => {
+      let granted = Slot{..slot, idle: rest}
+      (State{..*state, slots: slots.insert(key, granted), counts: Statistics{..counts, reused: counts.reused + 1, active: counts.active + 1}}, (Some(Reused(last)), stale))
+    }
+    case _ => {
+      if slot.open < maxPerServer {
+        let reserved = Slot{..slot, open: slot.open + 1}
+        (State{..*state, slots: slots.insert(key, reserved), counts: Statistics{..counts, opened: counts.opened + 1, active: counts.active + 1}}, (Some(Fresh), stale))
+      } else {
+        (State{..*state, slots: slots, counts: counts}, (None, stale))
+      }
+    }
+  }
+}
+
+/// The slot of an origin, or an empty one.
+fn slotOf(state: &State, key: Str) -> Slot {
+  match state.slots.get(key) {
+    case Some(found) => found
+    case None => Slot{idle: [], open: 0}
+  }
+}

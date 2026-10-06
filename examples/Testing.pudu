@@ -1,0 +1,38 @@
+/** @Examples.Testing.Program — a client tested against a stub primary handler */
+module Testing
+
+import Std.Http as Http
+import Std.Io as Io
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+
+/// Answers the weather from a client, the code under test.
+fn forecast(client: &Client.Client, city: Str) -> Str {
+  match Client.getText(client, "forecast?city=" + city) {
+    case Ok(text) => city + ": " + text
+    case Err(HttpClient.Unsuccessful(404, _)) => city + ": unknown"
+    case Err(failure) => city + ": " + HttpClient.describe(&failure)
+  }
+}
+
+/// Checks the code under test against stubbed answers, answering 0 when every case held.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.when(&stub, |request: Request.Request| request.uri.endsWith("city=Lima"), |request: Request.Request| Ok(Response.answer(&request, 200).withText("sunny")))
+  Stub.when(&stub, |request: Request.Request| request.uri.endsWith("city=Oslo"), |_request: Request.Request| Err(HttpClient.Connection("refused")))
+  let factory = match Factory.build([Builder.named("weather").withBaseAddress("https://weather.test/").withPrimary(|| Stub.send(&stub))]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let client = Factory.createClient(&factory, "weather")
+  let answers = [forecast(&client, "Lima"), forecast(&client, "Pune"), forecast(&client, "Oslo")]
+  for answer in answers { let _said = Io.writeLine(answer) }
+  let asked = Stub.received(&stub).map(|request: Request.Request| request.uri)
+  let expected = ["Lima: sunny", "Pune: unknown", "Oslo: The connection failed: refused"]
+  if answers == expected && asked.length() == 3 && asked[0] == "https://weather.test/forecast?city=Lima" && Stub.received(&stub)[0].method == Http.Get { 0 } else { 1 }
+}

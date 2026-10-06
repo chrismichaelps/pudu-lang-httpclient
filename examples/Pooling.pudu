@@ -1,0 +1,60 @@
+/** @Examples.Pooling.Program — pooled connections, lifetimes, cookies, and decompression */
+module Pooling
+
+import Std.Compress.Gzip as Gzip
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Io as Io
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Cookies as Cookies
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Transport as Transport
+
+/// Starts a local server that sets a cookie, checks it, and compresses a report; answers its address.
+fn serve() -> (Server.Running, Str) {
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let server = Server.server(&Route.routing(&[
+        Route.get("/login", |_request: Route.Request| Http.Response{..Reply.text(200, "welcome"), headers: [("set-cookie", "session=s3cr3t; Path=/; Max-Age=600")]}),
+        Route.get("/report", fn(request: Route.Request) -> Http.Response {
+            if Route.header(&request, "cookie") != Some("session=s3cr3t") { return Reply.text(401, "log in first") }
+            Http.Response{..Reply.bytes(200, "text/plain", &Gzip.compressText("quarterly numbers", &Gzip.config())), headers: [("content-type", "text/plain"), ("content-encoding", "gzip")]}
+          })
+      ]))
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  (running, "http://127.0.0.1:" + show(Server.portOf(&running)) + "/")
+}
+
+/// Logs in and reads a compressed report over one kept-alive connection, answering 0 on success.
+fn main() -> Int {
+  let (running, base) = serve()
+  let jar = Cookies.jar()
+  let options = Factory.Options{listeners: Events.listeners().onPipelineChanged(fn(event: Events.PipelineChanged) -> () {
+        let _said = Io.writeLine("pipeline " + event.client + " #" + show(event.generation) + " " + show(event.stage))
+      }) }
+  let factory = match Factory.buildWith(&options, [
+      Builder.named("reports").withBaseAddress(base).withHandlerLifetime(60000).withTransport(Transport.defaults().withCookies(jar).withDecompression().withMaxConnectionsPerServer(8).withPooledConnectionIdleTimeout(30000))
+    ]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let client = Factory.createClient(&factory, "reports")
+  let _welcome = Client.getText(&client, "login")
+  let report = Client.getText(&client, "report")
+  let stats = Factory.statistics(&factory, "reports")
+  let _said = Io.writeLine(show(report) + " " + show(stats) + " saved cookies: " + Cookies.save(&jar))
+  Factory.dispose(&factory)
+  let _stopped = Server.stop(&running)
+  let reused = match stats {
+    case Some(found) => found.opened == 1 && found.reused == 1
+    case None => false
+  }
+  if report == Ok("quarterly numbers") && reused { 0 } else { 1 }
+}
