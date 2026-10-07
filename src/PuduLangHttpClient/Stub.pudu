@@ -40,7 +40,12 @@ export fn respond(stub: &Stub, method: Http.Method, path: Str, code: Int, body: 
 export fn send(stub: &Stub) -> Handler.Send {
   let held = *stub
   fn(request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] {
-    if let Err(why) = Cancel.check(&token) { return Err(HttpClient.Cancelled(Cancel.explain(&why))) }
+    if let Err(why) = Cancel.check(&token) {
+      return match why {
+        case Cancel.Requested(reason) => Err(HttpClient.Cancelled(reason))
+        case Cancel.DeadlineExceeded => Err(HttpClient.TimedOut(0))
+      }
+    }
     Shared.update(&held.received, |held: Array[Request.Request]| held.push(request))
     for rule in Shared.current(&held.rules) {
       if (rule.matches)(request) { return delivered((rule.answer)(request)) }

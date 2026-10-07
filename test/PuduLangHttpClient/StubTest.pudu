@@ -42,7 +42,7 @@ fn main() -> Int {
       Test.equals("another method on the same path has its own rule", &made, &Ok((201, "made"))),
       Test.equals("a rule may answer a failure", &failed, &Err(HttpClient.Connection("down"))),
       Test.equals("a request no rule answers is not found", &unknown, &Ok((404, ""))),
-      Test.equals("a cancelled request is refused", &refused, &Err(HttpClient.Cancelled("cancelled: halt"))),
+      Test.equals("a cancelled request is refused", &refused, &Err(HttpClient.Cancelled("halt"))),
       Test.equals("a receiver gets the body and the response keeps none", &(shape(&streamed), Result.unwrapOr(Sync.get(&taken), ByteSeq.empty()).toText()), &(Ok((200, "")), Some("[]"))),
       Test.equals("every request received is kept in order, cancelled ones excepted", &Stub.received(&stub).map(|request: Request.Request| request.uri), &["http://a/users?page=1", "http://a/users", "http://a/fail", "http://a/none", "http://a/users"])
     ])
