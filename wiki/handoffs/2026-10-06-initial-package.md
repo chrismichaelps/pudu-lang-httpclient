@@ -2,7 +2,7 @@
 type: handoff
 from_role: Forensic Guardian
 to_role: Architect
-status: in-progress
+status: complete
 tags: [handoff, delivery]
 ---
 
@@ -13,7 +13,15 @@ tags: [handoff, delivery]
 - Issue #1 is the ready issue; `feature/1-initial-httpclient-package` is branched from `dev`, which
   is branched from the `main` baseline.
 - Every module under `src/` has its mirrored page with a resolved Grill Log ([[src/_MOC]]).
-- Suites, examples, and the mutation gate as described in [[architecture/TESTING]].
+- Against the published 0.1.3 compiler: `pudu check`, `pudu fmt --check`, and `pudu lint` are clean
+  over `src`, `test`, `tools`, and `examples`; 41 suites pass with 434 assertions; every example
+  answers 0; the mutation gate kills 178 of 178 mutants of `Domain/` ([[architecture/TESTING]]).
+- PR #2 into `dev` and PR #3 into `main` passed the Linux `checks` and `mutation` jobs.
+- Released 0.1.0 as tag `v0.1.0` with a GitHub release; `pudu search` lists
+  `@chrismichaelps/pudu-lang-httpclient`, and a fresh project installs it and runs against it.
+- The GitHub wiki holds the API book: eleven chapters whose programs were checked and run against
+  the package, a reference index, and the worked programs.
+- A compiler issue found during the work is reported upstream as pudu-lang#442.
 
 ## Decided (do not re-litigate)
 
@@ -25,11 +33,11 @@ tags: [handoff, delivery]
 
 ## Open / Remaining
 
-- Open the pull request into `dev`, then release 0.1.0 from `main`.
+- None for the initial package.
 
 ## Exact next action
 
-Open the pull request from `feature/1-initial-httpclient-package` into `dev`.
+None; the initial package is released.
 
 ## Links
 
@@ -37,4 +45,4 @@ Open the pull request from `feature/1-initial-httpclient-package` into `dev`.
 
 ## Referenced by
 
-[[handoffs/_MOC]]
+[[CHANGELOG]] · [[handoffs/_MOC]]
