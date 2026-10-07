@@ -48,6 +48,8 @@ export const READ_CHUNK: Int
 
 export const POOL_WAIT_SLICE: Int
 
+export const ABORT_POLL: Int
+
 export const HTTP_PORT: Int
 
 export const HTTPS_PORT: Int
@@ -56,7 +58,7 @@ export const HTTPS_PORT: Int
 ### Linkage
 
 - **Requires:** nothing.
-- **Consumed by:** [[src/PuduLangHttpClient/Client]], [[src/PuduLangHttpClient/Domain/Expiry]], [[src/PuduLangHttpClient/Domain/Uri]], [[src/PuduLangHttpClient/Factory]], [[src/PuduLangHttpClient/Factory/Builder]], [[src/PuduLangHttpClient/Transport]], [[src/PuduLangHttpClient/Transport/Connect]], [[src/PuduLangHttpClient/Transport/Exchange]], [[src/PuduLangHttpClient/Transport/Pool]], [[src/PuduLangHttpClient/Transport/Wire]], [[src/PuduLangHttpClient/Utils/Tokens]].
+- **Consumed by:** [[src/PuduLangHttpClient/Client]], [[src/PuduLangHttpClient/Domain/Expiry]], [[src/PuduLangHttpClient/Domain/Uri]], [[src/PuduLangHttpClient/Factory]], [[src/PuduLangHttpClient/Factory/Builder]], [[src/PuduLangHttpClient/Transport]], [[src/PuduLangHttpClient/Transport/Abort]], [[src/PuduLangHttpClient/Transport/Connect]], [[src/PuduLangHttpClient/Transport/Exchange]], [[src/PuduLangHttpClient/Transport/Pool]], [[src/PuduLangHttpClient/Transport/Wire]], [[src/PuduLangHttpClient/Utils/Tokens]].
 
 ## Algorithm
 
@@ -83,4 +85,4 @@ DEPTH 0.3 (SHALLOW). Tested by the suite mirroring this module under `test/`.
 
 ## Referenced by
 
-[[src/PuduLangHttpClient/Client]] · [[src/PuduLangHttpClient/Constants/_MOC]] · [[src/PuduLangHttpClient/Domain/Expiry]] · [[src/PuduLangHttpClient/Domain/Uri]] · [[src/PuduLangHttpClient/Factory]] · [[src/PuduLangHttpClient/Factory/Builder]] · [[src/PuduLangHttpClient/Transport]] · [[src/PuduLangHttpClient/Transport/Connect]] · [[src/PuduLangHttpClient/Transport/Exchange]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Transport/Wire]] · [[src/PuduLangHttpClient/Utils/Tokens]]
+[[src/PuduLangHttpClient/Client]] · [[src/PuduLangHttpClient/Constants/_MOC]] · [[src/PuduLangHttpClient/Domain/Expiry]] · [[src/PuduLangHttpClient/Domain/Uri]] · [[src/PuduLangHttpClient/Factory]] · [[src/PuduLangHttpClient/Factory/Builder]] · [[src/PuduLangHttpClient/Transport]] · [[src/PuduLangHttpClient/Transport/Abort]] · [[src/PuduLangHttpClient/Transport/Connect]] · [[src/PuduLangHttpClient/Transport/Exchange]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Transport/Wire]] · [[src/PuduLangHttpClient/Utils/Tokens]]

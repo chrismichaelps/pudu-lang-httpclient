@@ -34,7 +34,7 @@ export fn update[S](target: &Shared[S], step: fn(S) -> S) -> ()
 ### Linkage
 
 - **Requires:** the standard library.
-- **Consumed by:** [[src/PuduLangHttpClient/Client]], [[src/PuduLangHttpClient/Cookies]], [[src/PuduLangHttpClient/Factory]], [[src/PuduLangHttpClient/Handlers/Metrics]], [[src/PuduLangHttpClient/Stub]], [[src/PuduLangHttpClient/Transport/Pool]].
+- **Consumed by:** [[src/PuduLangHttpClient/Client]], [[src/PuduLangHttpClient/Cookies]], [[src/PuduLangHttpClient/Factory]], [[src/PuduLangHttpClient/Handlers/Metrics]], [[src/PuduLangHttpClient/Stub]], [[src/PuduLangHttpClient/Transport/Abort]], [[src/PuduLangHttpClient/Transport/Pool]].
 
 ## Algorithm
 
@@ -60,4 +60,4 @@ DEPTH 0.7 (DEEP). Tested by the suite mirroring this module under `test/`.
 
 ## Referenced by
 
-[[grammar/pudu]] · [[src/PuduLangHttpClient/Client]] · [[src/PuduLangHttpClient/Cookies]] · [[src/PuduLangHttpClient/Factory]] · [[src/PuduLangHttpClient/Handlers/Metrics]] · [[src/PuduLangHttpClient/Stub]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Utils/_MOC]]
+[[grammar/pudu]] · [[src/PuduLangHttpClient/Client]] · [[src/PuduLangHttpClient/Cookies]] · [[src/PuduLangHttpClient/Factory]] · [[src/PuduLangHttpClient/Handlers/Metrics]] · [[src/PuduLangHttpClient/Stub]] · [[src/PuduLangHttpClient/Transport/Abort]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Utils/_MOC]]
