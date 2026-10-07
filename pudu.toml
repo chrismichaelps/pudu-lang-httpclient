@@ -1,6 +1,6 @@
 [package]
 name = "@chrismichaelps/pudu-lang-httpclient"
-version = "0.1.0"
+version = "0.1.1"
 description = "Named HTTP clients for Pudu: a client factory, delegating handlers, pooled keep-alive connections, handler lifetimes, logging, and resilience"
 license = "Apache-2.0"
 keywords = ["http", "http-client", "client-factory", "connection-pooling", "handlers", "pudu"]

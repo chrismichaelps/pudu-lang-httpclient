@@ -3,6 +3,7 @@ module PuduLangHttpClient.Transport.ExchangeTest
 
 import Std.Bytes as ByteSeq
 import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
 import Std.Http as Http
 import Std.Io as Io
 import Std.Net as Net
@@ -90,6 +91,15 @@ fn main() -> Int {
       let _held = Loopback.readRequest(&connection)
     })
   let unanswered = Transport.send(&Transport.create(Transport.defaults()))(Request.get(silent.base + "/"), Cancel.expiring(100))
+  let stopper = Cancel.token()
+  let abortTransport = Transport.create(Transport.defaults())
+  let _canceller = Concurrent.start(fn() -> () {
+      let _waited = Concurrent.sleep(60)
+      let _cancelled = Cancel.cancel(&stopper, "user left")
+    })
+  let abortBegan = clock()
+  let aborted = Transport.send(&abortTransport)(Request.get(silent.base + "/"), stopper)
+  let abortTook = clock() - abortBegan
   let headOnly = Transport.send(&Transport.create(Transport.defaults()))(Request.head(streamedServer.base + "/"), Cancel.expiring(2000))
 
   let uploadServer = Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
@@ -147,6 +157,7 @@ fn main() -> Int {
         }),
       Test.equals("a streamed body is sent in chunks", &Result.map(uploaded, |r: Response.Response| (Result.unwrapOr(Response.text(&r), ""), Response.header(&r, "x-chunked"))), &Ok(("2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n", Some("true")))),
       Test.equals("a redirect that would send a streamed body again is answered as it is", &Result.map(movedUpload, |r: Response.Response| r.status.code), &Ok(307)),
+      Test.equals("a request cancelled while waiting for its response stops at once and keeps no connection", &(Result.map(aborted, |r: Response.Response| r.status.code), abortTook < 1000, Transport.statistics(&abortTransport).idle), &(Err(HttpClient.Cancelled("user left")), true, 0)),
       Test.equals("a head request reads no body", &Result.map(headOnly, |r: Response.Response| (r.status.code, r.request.method, Response.bytes(&r).length())), &Ok((200, Http.Head, 0)))
     ])
   let ran = Test.run(&checks)

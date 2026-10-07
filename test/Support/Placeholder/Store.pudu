@@ -1,0 +1,152 @@
+/** @Test.Support.Placeholder.Store.Module — the placeholder records, changed only under a lock */
+module Support.Placeholder.Store
+
+import Std.Json as Json
+import Std.Math as Math
+import Std.Option as Option
+import Std.Result as Result
+import Std.Sync as Sync
+import Support.Placeholder.Data as Data
+
+/** @Test.Support.Placeholder.Store.Store — every resource's records and the lock guarding them */
+export type Store = { lock: Sync.Mutex, records: Sync.Cell[Map[Str, Array[Json.Json]]] }
+
+/** @Test.Support.Placeholder.Store.Query — which records a listing answers, and in what order */
+export type Query = { filters: Array[(Str, Str)], start: Int, limit: Option[Int], sort: Option[Str], descending: Bool }
+
+/// A store holding the seed records.
+export fn seeded() -> Store { Store{lock: Sync.mutex(), records: Sync.cell(Data.seed())} }
+
+/// Whether a resource exists.
+export fn knows(resource: Str) -> Bool { Data.RESOURCES.contains(resource) }
+
+/// The records of a resource matching every filter, sorted, from `start`, at most `limit`, and how
+/// many matched in all.
+export fn list(store: &Store, resource: Str, query: &Query) -> (Array[Json.Json], Int) {
+  let matching = all(store, resource).filter(|record: Json.Json| query.filters.filter(|pair: (Str, Str)| fieldText(&record, pair[0]) != Some(pair[1])).isEmpty())
+  let ordered = match query.sort {
+    case Some(field) => {
+      let ascending = matching.sortBy(|left: Json.Json, right: Json.Json| sortKey(&left, field) < sortKey(&right, field))
+      if query.descending { ascending.reverse() } else { ascending }
+    }
+    case None => matching
+  }
+  let rest = if query.start >= ordered.length() { [] } else { ordered.slice(Math.max(query.start, 0), ordered.length()) }
+  let page = match query.limit {
+    case Some(most) => if most < rest.length() { rest.slice(0, Math.max(most, 0)) } else { rest }
+    case None => rest
+  }
+  (page, matching.length())
+}
+
+/// The record of a resource with an id.
+export fn find(store: &Store, resource: Str, id: Int) -> Option[Json.Json] {
+  match all(store, resource).filter(|record: Json.Json| idOf(&record) == id) {
+    case [first, ..] => Some(first)
+    case _ => None
+  }
+}
+
+/// Stores a new record under the next id and answers it.
+export fn create(store: &Store, resource: Str, fields: &Json.Json) -> Json.Json {
+  change(store, fn(records: Map[Str, Array[Json.Json]]) -> (Map[Str, Array[Json.Json]], Json.Json) {
+      let held = Option.unwrapOr(records.get(resource), [])
+      let next = held.reduce(|top: Int, record: Json.Json| if idOf(&record) > top { idOf(&record) } else { top }, 0) + 1
+      let made = Json.withField(fields, "id", Json.Number(next))
+      (records.insert(resource, held.push(made)), made)
+    })
+}
+
+/// Replaces a record's fields, keeping its id, and answers it, or `None` when it is absent.
+export fn replace(store: &Store, resource: Str, id: Int, fields: &Json.Json) -> Option[Json.Json] {
+  rewrite(store, resource, id, |_old: Json.Json| Json.withField(fields, "id", Json.Number(id)))
+}
+
+/// Merges fields into a record, keeping its id, and answers it, or `None` when it is absent.
+export fn patch(store: &Store, resource: Str, id: Int, fields: &Json.Json) -> Option[Json.Json] {
+  let pairs = Option.unwrapOr(Json.asObject(fields), [])
+  rewrite(store, resource, id, fn(old: Json.Json) -> Json.Json {
+      var merged = old
+      for (name, value) in pairs {
+        if name != "id" { merged = Json.withField(&merged, name, value) }
+      }
+      merged
+    })
+}
+
+/// Removes a record and answers whether it existed.
+export fn remove(store: &Store, resource: Str, id: Int) -> Bool {
+  change(store, fn(records: Map[Str, Array[Json.Json]]) -> (Map[Str, Array[Json.Json]], Bool) {
+      let held = Option.unwrapOr(records.get(resource), [])
+      let kept = held.filter(|record: Json.Json| idOf(&record) != id)
+      (records.insert(resource, kept), kept.length() < held.length())
+    })
+}
+
+/// The number of records a resource holds.
+export fn count(store: &Store, resource: Str) -> Int { all(store, resource).length() }
+
+/// The id of a record, or 0.
+export fn idOf(record: &Json.Json) -> Int {
+  match Json.field(record, "id") {
+    case Some(value) => Option.unwrapOr(Json.asInt(&value), 0)
+    case None => 0
+  }
+}
+
+/// A field written as the text a query compares it with.
+fn fieldText(record: &Json.Json, name: Str) -> Option[Str] {
+  let value = Json.field(record, name) ?
+  match Json.asText(&value) {
+    case Some(text) => Some(text)
+    case None => Some(Json.encode(&value))
+  }
+}
+
+/// The key a sort compares: numbers by value, everything else by its text, numbers first.
+fn sortKey(record: &Json.Json, field: Str) -> Str {
+  match Json.field(record, field) {
+    case Some(value) => match Json.asInt(&value) {
+      case Some(number) => "0" + show(number + 1000000000).drop(1)
+      case None => "1" + Option.unwrapOr(fieldText(record, field), "")
+    }
+    case None => "2"
+  }
+}
+
+/// Every record of a resource as it stands.
+fn all(store: &Store, resource: Str) -> Array[Json.Json] {
+  Option.unwrapOr(Result.unwrapOr(Sync.get(&store.records), mapOf([])).get(resource), [])
+}
+
+/// Applies one change to the records under the lock and answers what it computed.
+fn change[R](store: &Store, step: fn(Map[Str, Array[Json.Json]]) -> (Map[Str, Array[Json.Json]], R)) -> R {
+  let cell = store.records
+  match Sync.withLock(&store.lock, fn() -> R {
+      let (next, answer) = step(Result.unwrapOr(Sync.get(&cell), mapOf([])))
+      let _stored = Sync.set(&cell, next)
+      answer
+    }) {
+    case Ok(answer) => answer
+    case Err(problem) => panic("the placeholder store could not be locked: " + show(problem))
+  }
+}
+
+/// Rewrites one record under the lock and answers it, or `None` when it is absent.
+fn rewrite(store: &Store, resource: Str, id: Int, step: fn(Json.Json) -> Json.Json) -> Option[Json.Json] {
+  change(store, fn(records: Map[Str, Array[Json.Json]]) -> (Map[Str, Array[Json.Json]], Option[Json.Json]) {
+      let held = Option.unwrapOr(records.get(resource), [])
+      var found: Option[Json.Json] = None
+      var updated: Array[Json.Json] = []
+      for record in held {
+        if idOf(&record) == id {
+          let next = step(record)
+          found = Some(next)
+          updated = updated.push(next)
+        } else {
+          updated = updated.push(record)
+        }
+      }
+      (records.insert(resource, updated), found)
+    })
+}

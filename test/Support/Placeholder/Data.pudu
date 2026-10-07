@@ -1,0 +1,74 @@
+/** @Test.Support.Placeholder.Data.Module — the seed records of the placeholder service */
+module Support.Placeholder.Data
+
+import Std.Json as Json
+
+/** @Test.Support.Placeholder.Data.Relation — a nested route: the child resource and its parent key */
+export type Relation = { parent: Str, child: Str, key: Str }
+
+/// The resources the service holds, in the order they are listed.
+export const RESOURCES: Array[Str] = ["posts", "comments", "albums", "photos", "todos", "users"]
+
+/// How many records each resource starts with, as the public service holds.
+export const COUNTS: Map[Str, Int] = mapOf([("posts", 100), ("comments", 500), ("albums", 100), ("photos", 5000), ("todos", 200), ("users", 10)])
+
+/// The nested routes: `/parent/:id/child` lists the children whose key is the parent's id.
+export const RELATIONS: Array[Relation] = [
+  Relation{parent: "posts", child: "comments", key: "postId"},
+  Relation{parent: "albums", child: "photos", key: "albumId"},
+  Relation{parent: "users", child: "posts", key: "userId"},
+  Relation{parent: "users", child: "albums", key: "userId"},
+  Relation{parent: "users", child: "todos", key: "userId"}
+]
+
+/// The ten users: name, user name, email, street, suite, city, zip code, latitude, longitude,
+/// phone, website, company, catch phrase, and business.
+const USERS: Array[Array[Str]] = [
+  ["Leanne Graham", "Bret", "Sincere@april.biz", "Kulas Light", "Apt. 556", "Gwenborough", "92998-3874", "-37.3159", "81.1496", "1-770-736-8031 x56442", "hildegard.org", "Romaguera-Crona", "Multi-layered client-server neural-net", "harness real-time e-markets"],
+  ["Ervin Howell", "Antonette", "Shanna@melissa.tv", "Victor Plains", "Suite 879", "Wisokyburgh", "90566-7771", "-43.9509", "-34.4618", "010-692-6593 x09125", "anastasia.net", "Deckow-Crist", "Proactive didactic contingency", "synergize scalable supply-chains"],
+  ["Clementine Bauch", "Samantha", "Nathan@yesenia.net", "Douglas Extension", "Suite 847", "McKenziehaven", "59590-4157", "-68.6102", "-47.0653", "1-463-123-4447", "ramiro.info", "Romaguera-Jacobson", "Face to face bifurcated interface", "e-enable strategic applications"],
+  ["Patricia Lebsack", "Karianne", "Julianne.OConner@kory.org", "Hoeger Mall", "Apt. 692", "South Elvis", "53919-4257", "29.4572", "-164.2990", "493-170-9623 x156", "kale.biz", "Robel-Corkery", "Multi-tiered zero tolerance productivity", "transition cutting-edge web services"],
+  ["Chelsey Dietrich", "Kamren", "Lucio_Hettinger@annie.ca", "Skiles Walks", "Suite 351", "Roscoeview", "33263", "-31.8129", "62.5342", "(254)954-1289", "demarco.info", "Keebler LLC", "User-centric fault-tolerant solution", "revolutionize end-to-end systems"],
+  ["Mrs. Dennis Schulist", "Leopoldo_Corkery", "Karley_Dach@jasper.info", "Norberto Crossing", "Apt. 950", "South Christy", "23505-1337", "-71.4197", "71.7478", "1-477-935-8478 x6430", "ola.org", "Considine-Lockman", "Synchronised bottom-line interface", "e-enable innovative applications"],
+  ["Kurtis Weissnat", "Elwyn.Skiles", "Telly.Hoeger@billy.biz", "Rex Trail", "Suite 280", "Howemouth", "58804-1099", "24.8918", "21.8984", "210.067.6132", "elvis.io", "Johns Group", "Configurable multimedia task-force", "generate enterprise e-tailers"],
+  ["Nicholas Runolfsdottir V", "Maxime_Nienow", "Sherwood@rosamond.me", "Ellsworth Summit", "Suite 729", "Aliyaview", "45169", "-14.3990", "-120.7677", "586.493.6943 x140", "jacynthe.com", "Abernathy Group", "Implemented secondary concept", "e-enable extensible e-tailers"],
+  ["Glenna Reichert", "Delphine", "Chaim_McDermott@dana.io", "Dayna Park", "Suite 449", "Bartholomebury", "76495-3109", "24.6463", "-168.8889", "(775)976-6794 x41206", "conrad.com", "Yost and Sons", "Switchable contextually-based project", "aggregate real-time technologies"],
+  ["Clementina DuBuque", "Moriah.Stanton", "Rey.Padberg@karina.biz", "Kattie Turnpike", "Suite 198", "Lebsackbury", "31428-2261", "-38.2386", "57.2232", "024-648-3804", "ambrose.net", "Hoeger LLC", "Centralized empowering task-force", "target end-to-end models"]
+]
+
+/// Every resource's records as the service starts with them.
+export fn seed() -> Map[Str, Array[Json.Json]] {
+  mapOf([
+      ("posts", numbered(100, |id: Int| Json.object(&[("userId", Json.Number(owner(id, 10))), ("id", Json.Number(id)), ("title", Json.Text("post " + show(id))), ("body", Json.Text("the body of post " + show(id)))]))),
+      ("comments", numbered(500, |id: Int| Json.object(&[("postId", Json.Number(owner(id, 5))), ("id", Json.Number(id)), ("name", Json.Text("comment " + show(id))), ("email", Json.Text("reader" + show(id) + "@example.test")), ("body", Json.Text("the body of comment " + show(id)))]))),
+      ("albums", numbered(100, |id: Int| Json.object(&[("userId", Json.Number(owner(id, 10))), ("id", Json.Number(id)), ("title", Json.Text("album " + show(id)))]))),
+      ("photos", numbered(5000, |id: Int| Json.object(&[("albumId", Json.Number(owner(id, 50))), ("id", Json.Number(id)), ("title", Json.Text("photo " + show(id))), ("url", Json.Text("https://picsum.photos/seed/" + show(id) + "/600")), ("thumbnailUrl", Json.Text("https://picsum.photos/seed/" + show(id) + "/150"))]))),
+      ("todos", numbered(200, |id: Int| Json.object(&[("userId", Json.Number(owner(id, 20))), ("id", Json.Number(id)), ("title", Json.Text("todo " + show(id))), ("completed", Json.Boolean(id % 3 == 0))]))),
+      ("users", numbered(10, |id: Int| user(id, &USERS[id - 1])))
+    ])
+}
+
+/// The records numbered from 1 to `count`.
+fn numbered(count: Int, make: fn(Int) -> Json.Json) -> Array[Json.Json] {
+  var records: Array[Json.Json] = []
+  var id = 1
+  while id <= count {
+    records = records.push(make(id))
+    id = id + 1
+  }
+  records
+}
+
+/// The owner of a record when every owner holds `per` records in order.
+fn owner(id: Int, per: Int) -> Int { (id - 1) / per + 1 }
+
+/// One user record from its fields.
+fn user(id: Int, fields: &Array[Str]) -> Json.Json {
+  let text = |index: Int| Json.Text(fields[index])
+  Json.object(&[
+      ("id", Json.Number(id)), ("name", text(0)), ("username", text(1)), ("email", text(2)),
+      ("address", Json.object(&[("street", text(3)), ("suite", text(4)), ("city", text(5)), ("zipcode", text(6)), ("geo", Json.object(&[("lat", text(7)), ("lng", text(8))]))])),
+      ("phone", text(9)), ("website", text(10)),
+      ("company", Json.object(&[("name", text(11)), ("catchPhrase", text(12)), ("bs", text(13))]))
+    ])
+}

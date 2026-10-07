@@ -49,7 +49,7 @@ export fn received(stub: &Stub) -> Array[Request.Request]
 
 ## Negative Logic (Prohibited Paths)
 
-- A cancelled request is refused and not recorded.
+- A cancelled request is refused with the caller's reason and not recorded; a passed deadline is a timeout.
 
 ## Edge Cases
 

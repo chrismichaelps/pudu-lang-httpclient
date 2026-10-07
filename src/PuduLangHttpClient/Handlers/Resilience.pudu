@@ -156,6 +156,14 @@ export fn translated(failure: &Guarded.Failure[HttpClient.Failure]) -> HttpClien
   }
 }
 
+/// The words a cancellation carries: the reason given, or that the deadline passed.
+fn reasonOf(why: &Cancel.Reason) -> Str {
+  match why {
+    case Cancel.Requested(reason) => reason
+    case Cancel.DeadlineExceeded => Cancel.explain(why)
+  }
+}
+
 /// The response the rest of the pipeline answers under the resilience pipeline. An attempt stopped
 /// by its own token answers a cancellation so the strategy that fired it can tell; a deadline of the
 /// caller's that passed stays a timeout.
@@ -166,7 +174,7 @@ fn guarded(pipeline: &Guarding, request: Request.Request, token: &Cancel.Token, 
         case Ok(response) => Ok(response)
         case Err(failure) => {
           match Cancel.reason(&attempt.token) {
-            case Some(why) => if HttpClient.isTimeout(&failure) || HttpClient.isCancellation(&failure) { Err(Guarded.Cancelled(Cancel.explain(&why))) } else { Err(Guarded.Raised(failure)) }
+            case Some(why) => if HttpClient.isTimeout(&failure) || HttpClient.isCancellation(&failure) { Err(Guarded.Cancelled(reasonOf(&why))) } else { Err(Guarded.Raised(failure)) }
             case None => Err(Guarded.Raised(failure))
           }
         }

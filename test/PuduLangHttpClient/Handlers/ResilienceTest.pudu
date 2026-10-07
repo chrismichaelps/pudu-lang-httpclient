@@ -132,7 +132,7 @@ fn main() -> Int {
           case Err(HttpClient.TimedOut(millis)) => millis >= 25 && millis < 2000
           case _ => false
         }),
-      Test.equals("a caller's cancellation stays a cancellation", &callerCancelled, &Err(HttpClient.Cancelled("cancelled: caller"))),
+      Test.equals("a caller's cancellation stays a cancellation", &callerCancelled, &Err(HttpClient.Cancelled("caller"))),
       Test.that("a full rate limiter rejects", rejected(&limited)),
       Test.equals("a pipeline is chosen per request", &(selectedGet, Shared.current(&getCalls), selectedPost, Shared.current(&postCalls)), &(Ok(200), 2, Ok(503), 1)),
       Test.equals("a registry's pipeline is used", &(fromRegistry, Shared.current(&registryCalls)), &(Ok(200), 2)),

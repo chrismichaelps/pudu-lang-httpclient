@@ -1,0 +1,163 @@
+/** @Test.Support.Placeholder.Server.Module — the placeholder REST service on the loopback interface */
+module Support.Placeholder.Server
+
+import Std.Concurrent as Concurrent
+import Std.Http as Http
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Json as Json
+import Std.Option as Option
+import Std.Result as Result
+import Std.Sync as Sync
+import Support.Placeholder.Data as Data
+import Support.Placeholder.Store as Store
+
+/** @Test.Support.Placeholder.Server.Placeholder — the running service, its records, and its faults */
+export type Placeholder = { running: Server.Running, base: Str, store: Store.Store, faults: Sync.Cell[Int], lock: Sync.Mutex, handled: Sync.Counter }
+
+/// The query names that steer a listing rather than filter it.
+const CONTROLS: Set[Str] = #{"_start", "_limit", "_sort", "_order", "_delay"}
+
+/// Starts the service with the seed records.
+export fn start() -> Placeholder {
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic("the placeholder service did not start: " + show(problem))
+  }
+  let made = Placeholder{running: running, base: "http://127.0.0.1:" + show(Server.portOf(&running)), store: Store.seeded(), faults: Sync.cell(0), lock: Sync.mutex(), handled: Sync.counter(0)}
+  let server = Server.Server{..Server.server(&Route.routing(&routes(&made))), workers: 32, queueCapacity: 256}
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  made
+}
+
+/// Stops the service.
+export fn stop(service: &Placeholder) -> () { let _stopped = Server.stop(&service.running) }
+
+/// Makes the next `count` requests answer 503 with `retry-after: 0`.
+export fn failNext(service: &Placeholder, count: Int) -> () { let _set = Sync.set(&service.faults, count) }
+
+/// How many requests the service has handled.
+export fn handled(service: &Placeholder) -> Int { Result.unwrapOr(Sync.count(&service.handled), 0) }
+
+/// Every route: each verb on each resource, and each nested listing.
+fn routes(service: &Placeholder) -> Array[Route.Route] {
+  var made: Array[Route.Route] = []
+  for resource in Data.RESOURCES {
+    let collection = "/" + resource
+    let member = collection + "/:id"
+    made = made
+      .push(Route.get(collection, guarded(service, |request: Route.Request| listing(service, resource, &request, []))))
+      .push(Route.get(member, guarded(service, |request: Route.Request| reading(service, resource, &request))))
+      .push(Route.post(collection, guarded(service, |request: Route.Request| creating(service, resource, &request))))
+      .push(Route.put(member, guarded(service, |request: Route.Request| writing(service, resource, &request, false))))
+      .push(Route.patch(member, guarded(service, |request: Route.Request| writing(service, resource, &request, true))))
+      .push(Route.delete(member, guarded(service, |request: Route.Request| deleting(service, resource, &request))))
+  }
+  for relation in Data.RELATIONS {
+    made = made.push(Route.get("/" + relation.parent + "/:id/" + relation.child, guarded(service, fn(request: Route.Request) -> Http.Response {
+            match idParam(&request) {
+              case Some(id) => if Store.find(&service.store, relation.parent, id) == None { notFound() } else { listing(service, relation.child, &request, [(relation.key, show(id))]) }
+              case None => notFound()
+            }
+          })))
+  }
+  made
+}
+
+/// A handler that counts the request, answers an injected fault while any remain, and waits the
+/// `_delay` the query asks for before handling it.
+fn guarded(service: &Placeholder, handle: Route.Handler) -> Route.Handler {
+  let held = *service
+  fn(request: Route.Request) -> Http.Response {
+    let _counted = Sync.increment(&held.handled, 1)
+    let faulted = Result.unwrapOr(Sync.withLock(&held.lock, fn() -> Bool {
+          let left = Result.unwrapOr(Sync.get(&held.faults), 0)
+          if left > 0 { let _taken = Sync.set(&held.faults, left - 1) }
+          left > 0
+        }), false)
+    if faulted { return Http.Response{..json(503, &Json.object(&[("error", Json.Text("unavailable"))])), headers: [("content-type", "application/json; charset=utf-8"), ("retry-after", "0")]} }
+    if let Some(millis) = Option.andThen(request.query.get("_delay"), |text: Str| text.toInt()) { let _waited = Concurrent.sleep(millis) }
+    handle(request)
+  }
+}
+
+/// The records of a resource the query and the extra filters select, with their total count.
+fn listing(service: &Placeholder, resource: Str, request: &Route.Request, extra: Array[(Str, Str)]) -> Http.Response {
+  let filters = request.query.entries().filter(|pair: (Str, Str)| !(pair[0] in CONTROLS)).concat(extra)
+  let query = Store.Query {
+    filters: filters,
+    start: Option.unwrapOr(Option.andThen(request.query.get("_start"), |text: Str| text.toInt()), 0),
+    limit: Option.andThen(request.query.get("_limit"), |text: Str| text.toInt()),
+    sort: request.query.get("_sort"),
+    descending: request.query.get("_order") == Some("desc")
+  }
+  let (page, total) = Store.list(&service.store, resource, &query)
+  Http.Response{..json(200, &Json.list(&page)), headers: [("content-type", "application/json; charset=utf-8"), ("x-total-count", show(total))]}
+}
+
+/// One record, or 404.
+fn reading(service: &Placeholder, resource: Str, request: &Route.Request) -> Http.Response {
+  match Option.andThen(idParam(request), |id: Int| Store.find(&service.store, resource, id)) {
+    case Some(record) => json(200, &record)
+    case None => notFound()
+  }
+}
+
+/// A new record under the next id, answered 201 with its location; a body that is not a JSON object
+/// is 400.
+fn creating(service: &Placeholder, resource: Str, request: &Route.Request) -> Http.Response {
+  match objectBody(request) {
+    case Ok(fields) => {
+      let made = Store.create(&service.store, resource, &fields)
+      Http.Response{..json(201, &made), headers: [("content-type", "application/json; charset=utf-8"), ("location", service.base + "/" + resource + "/" + show(Store.idOf(&made)))]}
+    }
+    case Err(response) => response
+  }
+}
+
+/// A record replaced or patched, or 404 when it is absent, or 400 for a body that is not a JSON object.
+fn writing(service: &Placeholder, resource: Str, request: &Route.Request, merging: Bool) -> Http.Response {
+  let id = match idParam(request) {
+    case Some(found) => found
+    case None => { return notFound() }
+  }
+  match objectBody(request) {
+    case Ok(fields) => {
+      let written = if merging { Store.patch(&service.store, resource, id, &fields) } else { Store.replace(&service.store, resource, id, &fields) }
+      match written {
+        case Some(record) => json(200, &record)
+        case None => notFound()
+      }
+    }
+    case Err(response) => response
+  }
+}
+
+/// An empty object once the record is removed, or 404 when it is absent.
+fn deleting(service: &Placeholder, resource: Str, request: &Route.Request) -> Http.Response {
+  match idParam(request) {
+    case Some(id) => if Store.remove(&service.store, resource, id) { json(200, &Json.object(&[])) } else { notFound() }
+    case None => notFound()
+  }
+}
+
+/// The request's body as a JSON object, or the 400 response refusing it.
+fn objectBody(request: &Route.Request) -> Result[Json.Json, Http.Response] {
+  match Json.decode(Route.body(request)) {
+    case Ok(value) => if Json.asObject(&value) == None { Err(badRequest("the body must be a JSON object")) } else { Ok(value) }
+    case Err(problem) => Err(badRequest(Json.explain(&problem)))
+  }
+}
+
+/// The `id` route parameter as a number.
+fn idParam(request: &Route.Request) -> Option[Int] { Option.andThen(Route.param(request, "id"), |text: Str| text.toInt()) }
+
+/// A JSON response.
+fn json(code: Int, value: &Json.Json) -> Http.Response { Reply.json(code, Json.encode(value)) }
+
+/// The empty object the service answers for a missing record.
+fn notFound() -> Http.Response { json(404, &Json.object(&[])) }
+
+/// A refusal naming what was wrong with the request.
+fn badRequest(reason: Str) -> Http.Response { json(400, &Json.object(&[("error", Json.Text(reason))])) }
