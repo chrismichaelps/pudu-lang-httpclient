@@ -7,8 +7,10 @@ tags: [changelog]
 
 ## 2026-10-07 — Release 0.1.1 (#5)
 
-- Released 0.1.1 as tag `v0.1.1` with a GitHub release: mid-request cancellation and the
-  placeholder end-to-end suite.
+- Released 0.1.1 as tag `v0.1.1` with a GitHub release: an explicit cancellation now stops a
+  request mid-exchange at once instead of waiting for a phase boundary, and cancellations report
+  the caller's own reason through the resilience handler and the stub
+  ([[decisions/ADR-0004-deadline-cancellation]]).
 
 ## 2026-10-07 — Placeholder service suite and mid-request cancellation (#5)
 
