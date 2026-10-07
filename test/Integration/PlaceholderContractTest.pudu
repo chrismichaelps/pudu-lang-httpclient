@@ -1,0 +1,117 @@
+/** @Test.Integration.PlaceholderContract.Suite — the placeholder service read through a typed client */
+module Integration.PlaceholderContractTest
+
+import Std.Io as Io
+import Std.Json as Json
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport as Transport
+import PuduLangHttpClient.Utils.Shared as Shared
+import Support.Placeholder.Api as Api
+import Support.Placeholder.Server as Placeholder
+
+/// The number of records an outcome holds, or -1 for a failure.
+fn sizeOf[T](outcome: &HttpClient.Outcome[Array[T]]) -> Int {
+  match outcome {
+    case Ok(items) => items.length()
+    case Err(_) => -1
+  }
+}
+
+/// The ids of the records an outcome holds.
+fn idsOf(outcome: &HttpClient.Outcome[Array[Api.Post]]) -> Array[Int] {
+  match outcome {
+    case Ok(items) => items.map(|post: Api.Post| post.id)
+    case Err(_) => []
+  }
+}
+
+/// Whether every record of an outcome belongs to the owner.
+fn allOwnedBy(outcome: &HttpClient.Outcome[Array[Api.Comment]], postId: Int) -> Bool {
+  match outcome {
+    case Ok(items) => items.filter(|comment: Api.Comment| comment.postId != postId).isEmpty() && !items.isEmpty()
+    case Err(_) => false
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let service = Placeholder.start()
+  let completed = Shared.shared(0)
+  let listeners = Events.listeners().onRequestCompleted(|_event: Events.RequestCompleted| Shared.update(&completed, |count: Int| count + 1))
+  let factory = match Factory.buildWith(&Factory.Options{listeners: listeners}, [
+      Builder.defaults().withDefaultHeader("user-agent", "placeholder-suite/1.0").withTimeout(10000),
+      Builder.named("placeholder").withBaseAddress(service.base + "/").withTransport(Transport.defaults().withMaxConnectionsPerServer(8).withDecompression())
+    ]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let api = Factory.typed(&factory, "placeholder", |client: Client.Client| Api.Api{client: client})
+
+  let posts: HttpClient.Outcome[Array[Api.Post]] = Api.list(&api, "posts", &[])
+  let comments: HttpClient.Outcome[Array[Api.Comment]] = Api.list(&api, "comments", &[])
+  let albums: HttpClient.Outcome[Array[Api.Album]] = Api.list(&api, "albums", &[])
+  let photos: HttpClient.Outcome[Array[Api.Photo]] = Api.list(&api, "photos", &[])
+  let todos: HttpClient.Outcome[Array[Api.Todo]] = Api.list(&api, "todos", &[])
+  let users: HttpClient.Outcome[Array[Api.User]] = Api.list(&api, "users", &[])
+
+  let firstUser: HttpClient.Outcome[Api.User] = Api.find(&api, "users", 1)
+  let post: HttpClient.Outcome[Api.Post] = Api.find(&api, "posts", 42)
+  let photo: HttpClient.Outcome[Api.Photo] = Api.find(&api, "photos", 5000)
+  let missing: HttpClient.Outcome[Api.Post] = Api.find(&api, "posts", 101)
+  let notANumber = Result.map(Client.get(&api.client, "posts/abc"), |r: Response.Response| r.status.code)
+  let unknownResource = Result.map(Client.get(&api.client, "widgets"), |r: Response.Response| r.status.code)
+
+  let nestedComments: HttpClient.Outcome[Array[Api.Comment]] = Api.children(&api, "posts", 7, "comments")
+  let filteredComments: HttpClient.Outcome[Array[Api.Comment]] = Api.list(&api, "comments", &[("postId", "7")])
+  let userPosts: HttpClient.Outcome[Array[Api.Post]] = Api.children(&api, "users", 3, "posts")
+  let albumPhotos: HttpClient.Outcome[Array[Api.Photo]] = Api.children(&api, "albums", 2, "photos")
+  let userAlbums: HttpClient.Outcome[Array[Api.Album]] = Api.children(&api, "users", 10, "albums")
+  let userTodos: HttpClient.Outcome[Array[Api.Todo]] = Api.children(&api, "users", 4, "todos")
+  let orphan: HttpClient.Outcome[Array[Api.Post]] = Api.children(&api, "users", 11, "posts")
+  let doneTodos: HttpClient.Outcome[Array[Api.Todo]] = Api.list(&api, "todos", &[("userId", "1"), ("completed", "true")])
+
+  let page: HttpClient.Outcome[Api.Page[Api.Post]] = Api.page(&api, "posts", &[("_start", "10"), ("_limit", "5")])
+  let sorted: HttpClient.Outcome[Array[Api.Post]] = Api.list(&api, "posts", &[("_sort", "id"), ("_order", "desc"), ("_limit", "3")])
+  let pastEnd: HttpClient.Outcome[Array[Api.Post]] = Api.list(&api, "posts", &[("_start", "500")])
+  let headers = Result.map(Client.get(&api.client, "users/1"), |r: Response.Response| Response.header(&r, "content-type"))
+
+  let stats = Factory.statistics(&factory, "placeholder")
+  let sent = Placeholder.handled(&service)
+  Factory.dispose(&factory)
+  Placeholder.stop(&service)
+
+  let checks = Test.suite("Integration.PlaceholderContract", &[
+      Test.equals("every resource holds the public number of records", &[sizeOf(&posts), sizeOf(&comments), sizeOf(&albums), sizeOf(&photos), sizeOf(&todos), sizeOf(&users)], &[100, 500, 100, 5000, 200, 10]),
+      Test.equals("a user decodes with its nested address, position, and company", &Result.map(firstUser, |user: Api.User| (user.username, user.address.city, user.address.geo.lat, user.company.name)), &Ok(("Bret", "Gwenborough", "-37.3159", "Romaguera-Crona"))),
+      Test.equals("a post belongs to its owner by tens", &Result.map(post, |found: Api.Post| (found.id, found.userId, found.title)), &Ok((42, 5, "post 42"))),
+      Test.equals("the last photo belongs to the last album", &Result.map(photo, |found: Api.Photo| (found.albumId, found.thumbnailUrl)), &Ok((100, "https://picsum.photos/seed/5000/150"))),
+      Test.equals("a missing record is not found", &missing, &Err(HttpClient.Unsuccessful(404, "Not Found"))),
+      Test.equals("an id that is not a number and an unknown resource are not found", &(notANumber, unknownResource), &(Ok(404), Ok(404))),
+      Test.that("a post's nested comments are its five comments", sizeOf(&nestedComments) == 5 && allOwnedBy(&nestedComments, 7)),
+      Test.equals("a nested listing equals the filtered one", &nestedComments, &filteredComments),
+      Test.equals("nested listings hold each owner's share", &[sizeOf(&userPosts), sizeOf(&albumPhotos), sizeOf(&userAlbums), sizeOf(&userTodos)], &[10, 50, 10, 20]),
+      Test.equals("a missing parent is not found", &Result.map(orphan, |items: Array[Api.Post]| items.length()), &Err(HttpClient.Unsuccessful(404, "Not Found"))),
+      Test.equals("filters combine", &Result.map(doneTodos, |items: Array[Api.Todo]| items.map(|todo: Api.Todo| todo.id)), &Ok([3, 6, 9, 12, 15, 18])),
+      Test.equals("a page starts and stops where asked and reports the total", &Result.map(page, |found: Api.Page[Api.Post]| (found.items.map(|p: Api.Post| p.id), found.total)), &Ok(([11, 12, 13, 14, 15], 100))),
+      Test.equals("a listing sorts in descending order", &idsOf(&sorted), &[100, 99, 98]),
+      Test.equals("a start past the end lists nothing", &sizeOf(&pastEnd), &0),
+      Test.equals("responses are JSON", &headers, &Ok(Some("application/json"))),
+      Test.that("one pool served every request over a few kept-alive connections", match stats {
+          case Some(found) => found.opened <= 2 && found.reused >= 20
+          case None => false
+        }),
+      Test.equals("every request was heard once, and each but the unrouted one reached a route once", &(Shared.current(&completed), sent), &(24, 23))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

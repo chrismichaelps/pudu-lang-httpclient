@@ -1,0 +1,147 @@
+/** @Test.Integration.PlaceholderResilience.Suite — the placeholder service under faults, latency, and load */
+module Integration.PlaceholderResilienceTest
+
+import Std.Concurrent as Concurrent
+import Std.Io as Io
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Handlers.Logging as Logging
+import PuduLangHttpClient.Handlers.Metrics as Metrics
+import PuduLangHttpClient.Handlers.Resilience as Resilience
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Utils.Shared as Shared
+import PuduLangLog.Configuration as Configuration
+import PuduLangLog as Log
+import PuduLangLog.Sinks.Memory as Memory
+import PuduLangResilience.CircuitBreaker as CircuitBreaker
+import PuduLangResilience.Pipeline as Pipeline
+import PuduLangResilience.Retry as Retry
+import Support.Placeholder.Api as Api
+import Support.Placeholder.Server as Placeholder
+
+/// The status or failure of a request.
+fn statusOf(outcome: HttpClient.Outcome[Response.Response]) -> Result[Int, HttpClient.Failure] {
+  Result.map(outcome, |response: Response.Response| response.status.code)
+}
+
+/// Whether an outcome is a resilience rejection.
+fn isRejected(outcome: &Result[Int, HttpClient.Failure]) -> Bool {
+  match outcome {
+    case Err(HttpClient.Rejected(_)) => true
+    case _ => false
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let service = Placeholder.start()
+  let memory = Memory.create()
+  let logger = Configuration.create().minimumLevel(Log.Verbose).writeTo(Memory.sink(&memory)).createLogger()
+  let meter = Metrics.meter()
+  let failures = Shared.shared([])
+  let changes = Shared.shared(0)
+  let listeners = Events.listeners()
+    .onRequestFailed(|event: Events.RequestFailed| Shared.update(&failures, |held: Array[Str]| held.push(event.client + ": " + event.failure)))
+    .onPipelineChanged(|_event: Events.PipelineChanged| Shared.update(&changes, |count: Int| count + 1))
+  let options = Resilience.standardOptions()
+  let standard = match Resilience.standardWith(&Resilience.Standard{..options, retry: Retry.Options{..options.retry, delay: 5, useJitter: false}}) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Pipeline.explain(&invalid))
+  }
+  let breaker = match Pipeline.build([CircuitBreaker.strategy(CircuitBreaker.Options{..CircuitBreaker.defaults(), shouldHandle: Resilience.transient(), failureRatio: 0.5d, minimumThroughput: 2, samplingDuration: 5000, breakDuration: 5000})]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Pipeline.explain(&invalid))
+  }
+  let factory = match Factory.buildWith(&Factory.Options{listeners: listeners}, [
+      Builder.defaults().withBaseAddress(service.base + "/").withDefaultHeader("authorization", "Bearer secret-token").observedBy(Logging.observer(logger)).withHandler(Metrics.handler(&meter)),
+      Builder.named("resilient").withHandler(Resilience.handler(standard)),
+      Builder.named("guarded").withHandler(Resilience.handler(breaker)),
+      Builder.named("impatient").withTimeout(100),
+      Builder.named("rotating").withHandlerLifetime(25),
+      Builder.named("small").withMaxResponseContentBufferSize(1000)
+    ]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+
+  Placeholder.failNext(&service, 2)
+  let before = Placeholder.handled(&service)
+  let recovered: HttpClient.Outcome[Api.Post] = Api.find(&Api.Api{client: Factory.createClient(&factory, "resilient")}, "posts", 1)
+  let attempts = Placeholder.handled(&service) - before
+
+  Placeholder.failNext(&service, 50)
+  let guarded = Factory.createClient(&factory, "guarded")
+  let firstFault = statusOf(Client.get(&guarded, "posts/1"))
+  let secondFault = statusOf(Client.get(&guarded, "posts/1"))
+  let reachedBeforeOpen = Placeholder.handled(&service)
+  let rejected = statusOf(Client.get(&guarded, "posts/1"))
+  let reachedAfterOpen = Placeholder.handled(&service)
+  Placeholder.failNext(&service, 0)
+
+  let impatient = Factory.createClient(&factory, "impatient")
+  let slow = statusOf(Client.get(&impatient, "posts/1?_delay=400"))
+  let quick = statusOf(Client.get(&impatient, "posts/1"))
+
+  let pending = Factory.createClient(&factory, "resilient")
+  let cancelled = Sync.cell(Ok(0))
+  let worker = match Concurrent.start(fn() -> () { let _set = Sync.set(&cancelled, statusOf(Client.get(&pending, "posts?_delay=2000"))) }) {
+    case Ok(started) => started
+    case Err(problem) => panic(show(problem))
+  }
+  let _settle = Concurrent.sleep(50)
+  Client.cancelPending(&pending)
+  let _joined = Concurrent.join(&worker)
+
+  let plain = Factory.createClient(&factory, "rotating")
+  let buffered = Result.map(Client.getBytes(&plain, "photos"), |bytes: Bytes| bytes.length())
+  let streamedBytes = Sync.counter(0)
+  let streamed = Client.stream(&plain, "photos", fn(piece: Bytes) -> Bool {
+      let _added = Sync.increment(&streamedBytes, piece.length())
+      true
+    })
+  let tooLarge = Client.getBytes(&Factory.createClient(&factory, "small"), "photos")
+
+  var rotations: Array[Result[Int, HttpClient.Failure]] = []
+  var round = 0
+  while round < 6 {
+    rotations = rotations.push(statusOf(Client.get(&Factory.createClient(&factory, "rotating"), "todos/1")))
+    let _paced = Concurrent.sleep(15)
+    round = round + 1
+  }
+
+  let snapshot = Metrics.snapshot(&meter)
+  let messages = Memory.messages(&memory)
+  Factory.dispose(&factory)
+  Placeholder.stop(&service)
+
+  let checks = Test.suite("Integration.PlaceholderResilience", &[
+      Test.equals("two injected faults are retried until the record arrives", &(Result.map(recovered, |post: Api.Post| post.id), attempts), &(Ok(1), 3)),
+      Test.equals("a breaker passes faults until it has seen enough of them", &(firstFault, secondFault), &(Ok(503), Ok(503))),
+      Test.that("an open breaker rejects without reaching the service", isRejected(&rejected) && reachedAfterOpen == reachedBeforeOpen),
+      Test.equals("a request slower than the client's timeout times out with that timeout", &slow, &Err(HttpClient.TimedOut(100))),
+      Test.equals("a quick request through the same client still answers", &quick, &Ok(200)),
+      Test.equals("cancelling pending requests stops a slow one in flight", &Result.unwrapOr(Sync.get(&cancelled), Ok(0)), &Err(HttpClient.Cancelled("the client cancelled its pending requests"))),
+      Test.that("a streamed body is as long as the buffered one", match buffered {
+          case Ok(length) => length > 500000 && Result.unwrapOr(Sync.count(&streamedBytes), 0) == length && Result.isOk(&streamed)
+          case Err(_) => false
+        }),
+      Test.equals("a body over the client's buffer limit is refused", &Result.map(tooLarge, |bytes: Bytes| bytes.length()), &Err(HttpClient.ContentTooLarge(1000))),
+      Test.equals("requests keep answering while pipelines rotate underneath them", &rotations, &[Ok(200), Ok(200), Ok(200), Ok(200), Ok(200), Ok(200)]),
+      Test.that("rotating pipelines were created, expired, and closed", Shared.current(&changes) >= 8),
+      Test.that("listeners heard the timeout and the cancellation", Shared.current(&failures).filter(|line: Str| line.contains("impatient: The request timed out")).length() == 1 && Shared.current(&failures).filter(|line: Str| line.contains("cancelled")).length() == 1),
+      Test.that("metrics counted successes, server errors, and failures", snapshot.successful >= 10 && snapshot.serverErrors >= 2 && snapshot.failed >= 3 && snapshot.active == 0),
+      Test.that("logs list redacted credentials and never the token", messages.filter(|line: Str| line.contains("authorization: *")).length() > 0 && messages.filter(|line: Str| line.contains("secret-token")).isEmpty()),
+      Test.that("logs name each client's layers", messages.filter(|line: Str| line.startsWith("Start processing HTTP request")).length() > 0)
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}
