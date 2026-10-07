@@ -21,6 +21,8 @@ scripted raw-socket servers on the loopback interface, so no suite needs the net
 | Package | `test/Package/LayoutTest` | every shipped module is the root `PuduLangHttpClient` or under it, is named after its path, and agrees with the manifest |
 | Vault | `test/Package/VaultTest` | the vault mirrors `src/` page for page, every page has a Grill Log, every exported function is in its page's signatures, every link resolves, and every page lists the pages linking to it |
 | Integration | `test/Integration/ShopScenarioTest` | one shop through the factory: logging, metrics, listeners, the standard resilience pipeline, authorization, a typed client, and JSON |
+| Placeholder service | `test/Integration/Placeholder*Test`, `test/Support/Placeholder/` | a replica of the public placeholder REST service written in Pudu (six resources at the public counts and shapes, nested routes, filters, pagination, sorting, every CRUD verb, fault and latency injection) read and written through a typed client: the contract, every verb on every resource, validation, 25 parallel creates, keep-alive, retries, an opening breaker, timeouts, mid-request cancellation, streaming, limits, rotation, logs, metrics, and events |
+| Live contract | `test/Integration/PlaceholderLiveTest` with `PUDU_LIVE=1` | the replica agrees with the public service on counts, owners, records, and writes; offline it checks only the replica |
 | Examples | `examples/*.pudu`, run by CI | the documented programs compile and answer 0 |
 | Mutation | [[tools/Mutate]] | the domain suites notice single-point changes to the pure layer |
 

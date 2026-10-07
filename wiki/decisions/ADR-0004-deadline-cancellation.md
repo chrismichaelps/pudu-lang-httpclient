@@ -15,17 +15,21 @@ its token with short reads; and a thread cannot be interrupted.
 
 Every socket operation waits at most what remains of the request's deadline
 ([[src/PuduLangHttpClient/Transport/Wire]]); the token is checked between phases and while waiting
-for a pooled connection. A client links the caller's token, its pending token, and its timeout
+for a pooled connection. While an exchange runs, a watcher closes its connection as soon as the token
+is cancelled by request ([[src/PuduLangHttpClient/Transport/Abort]]), which wakes the blocked read or
+write at once. A client links the caller's token, its pending token, and its timeout
 ([[src/PuduLangHttpClient/Utils/Tokens]]).
 
 ## Consequences
 
-- Timeouts are exact; an explicit cancellation takes effect at the next phase or the deadline.
-- `cancelPending` stops requests waiting for a connection or between phases at once.
+- Timeouts are exact, and an explicit cancellation stops a request mid-read within one poll.
+- `cancelPending` stops every request in flight, wherever it is.
+- A cancelled request's connection is closed rather than pooled.
 
 ## Rejected
 
-- A watcher thread per request closing its socket on cancellation: a thread for every request.
+- Short polling reads: on the runtime a receive that times out closes the connection.
+- Cancellation only between phases: a request blocked on a slow server would wait for its deadline.
 
 ## Referenced by
 

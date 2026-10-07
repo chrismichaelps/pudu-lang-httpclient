@@ -1,0 +1,102 @@
+/** @Test.Support.Placeholder.Api.Module — a typed client of the placeholder service over named clients */
+module Support.Placeholder.Api
+
+import Std.Http as Http
+import Std.Json as Json
+import Std.Option as Option
+import Std.Url as Url
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Client.Json as JsonClient
+import PuduLangHttpClient.Endpoint as Endpoint
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Response as Response
+
+/** @Test.Support.Placeholder.Api.Post — a post */
+export type Post = { userId: Int, id: Int, title: Str, body: Str } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Comment — a comment on a post */
+export type Comment = { postId: Int, id: Int, name: Str, email: Str, body: Str } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Album — an album */
+export type Album = { userId: Int, id: Int, title: Str } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Photo — a photo in an album */
+export type Photo = { albumId: Int, id: Int, title: Str, url: Str, thumbnailUrl: Str } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Todo — a todo */
+export type Todo = { userId: Int, id: Int, title: Str, completed: Bool } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Geo — a position */
+export type Geo = { lat: Str, lng: Str } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Address — a postal address */
+export type Address = { street: Str, suite: Str, city: Str, zipcode: Str, geo: Geo } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Company — an employer */
+export type Company = { name: Str, catchPhrase: Str, bs: Str } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.User — a user */
+export type User = { id: Int, name: Str, username: Str, email: Str, address: Address, phone: Str, website: Str, company: Company } derives Json.Encode, Json.Decode
+
+/** @Test.Support.Placeholder.Api.Api — the typed client: one named client of the service */
+export type Api = { client: Client.Client }
+
+/** @Test.Support.Placeholder.Api.Page — one page of a listing and how many records matched in all */
+export type Page[T] = { items: Array[T], total: Int }
+
+/// A collection of a resource.
+const COLLECTION: Endpoint.Endpoint = Endpoint.Endpoint{method: Http.Post, template: ":resource"}
+
+/// One record of a resource.
+const MEMBER: Endpoint.Endpoint = Endpoint.Endpoint{method: Http.Get, template: ":resource/:id"}
+
+/// The children of a record.
+const NESTED: Endpoint.Endpoint = Endpoint.Endpoint{method: Http.Get, template: ":parent/:id/:child"}
+
+/// Every record of a resource matching the query's filters and controls.
+export fn list[T: Json.Decode](api: &Api, resource: Str, query: &Array[(Str, Str)]) -> HttpClient.Outcome[Array[T]] {
+  JsonClient.getFromJson(&api.client, resource + queryOf(query))
+}
+
+/// One page of a resource and the total the service reports.
+export fn page[T: Json.Decode](api: &Api, resource: Str, query: &Array[(Str, Str)]) -> HttpClient.Outcome[Page[T]] {
+  let response = Response.ensureSuccess(Client.get(&api.client, resource + queryOf(query)) ?) ?
+  let items: Array[T] = Response.readAs(&response) ?
+  Ok(Page{items: items, total: Option.unwrapOr(Option.andThen(Response.header(&response, "x-total-count"), |text: Str| text.toInt()), 0)})
+}
+
+/// The record of a resource with an id.
+export fn find[T: Json.Decode](api: &Api, resource: Str, id: Int) -> HttpClient.Outcome[T] {
+  Endpoint.call(&api.client, &MEMBER, &[("resource", resource), ("id", show(id))])
+}
+
+/// The children of a record through its nested route.
+export fn children[T: Json.Decode](api: &Api, parent: Str, id: Int, child: Str) -> HttpClient.Outcome[Array[T]] {
+  Endpoint.call(&api.client, &NESTED, &[("parent", parent), ("id", show(id)), ("child", child)])
+}
+
+/// The record the service stored for a new one.
+export fn create[T: Json.Encode + Json.Decode](api: &Api, resource: Str, record: &T) -> HttpClient.Outcome[T] {
+  Endpoint.callWith(&api.client, &COLLECTION, &[("resource", resource)], record)
+}
+
+/// The record after replacing every field.
+export fn replace[T: Json.Encode + Json.Decode](api: &Api, resource: Str, id: Int, record: &T) -> HttpClient.Outcome[T] {
+  Endpoint.callWith(&api.client, &Endpoint.Endpoint{..MEMBER, method: Http.Put}, &[("resource", resource), ("id", show(id))], record)
+}
+
+/// The record after merging some fields.
+export fn patch[T: Json.Decode](api: &Api, resource: Str, id: Int, fields: &Json.Json) -> HttpClient.Outcome[T] {
+  Endpoint.callWith(&api.client, &Endpoint.Endpoint{..MEMBER, method: Http.Patch}, &[("resource", resource), ("id", show(id))], fields)
+}
+
+/// The status of removing a record.
+export fn remove(api: &Api, resource: Str, id: Int) -> HttpClient.Outcome[Int] {
+  let response = Response.ensureSuccess(Endpoint.send(&api.client, &Endpoint.Endpoint{..MEMBER, method: Http.Delete}, &[("resource", resource), ("id", show(id))]) ?) ?
+  Ok(response.status.code)
+}
+
+/// The query string of the pairs, empty when there are none.
+fn queryOf(query: &Array[(Str, Str)]) -> Str {
+  if query.isEmpty() { "" } else { "?" + Url.renderQuery(query) }
+}

@@ -37,7 +37,7 @@ export fn send(pool: &Pool.Pool, route: &Connect.Route, sending: &Sending, token
 
 ### Linkage
 
-- **Requires:** [[src/PuduLangHttpClient]], [[src/PuduLangHttpClient/Content]], [[src/PuduLangHttpClient/Request]], [[src/PuduLangHttpClient/Transport/Connect]], [[src/PuduLangHttpClient/Transport/Exchange]], [[src/PuduLangHttpClient/Transport/Pool]], [[src/PuduLangHttpClient/Transport/Wire]], the standard library.
+- **Requires:** [[src/PuduLangHttpClient]], [[src/PuduLangHttpClient/Content]], [[src/PuduLangHttpClient/Request]], [[src/PuduLangHttpClient/Transport/Abort]], [[src/PuduLangHttpClient/Transport/Connect]], [[src/PuduLangHttpClient/Transport/Exchange]], [[src/PuduLangHttpClient/Transport/Pool]], [[src/PuduLangHttpClient/Transport/Wire]], the standard library.
 - **Consumed by:** [[src/PuduLangHttpClient/Transport]].
 
 ## Algorithm
@@ -48,10 +48,12 @@ export fn send(pool: &Pool.Pool, route: &Connect.Route, sending: &Sending, token
 ## Negative Logic (Prohibited Paths)
 
 - A timeout is never retried here; nor is a failure after any part of the response arrived.
+- A cancelled exchange is never retried and its connection is never pooled.
 
 ## Edge Cases
 
 - A connection that could not be opened forfeits its reservation.
+- [[src/PuduLangHttpClient/Transport/Abort]] watches every exchange for an explicit cancellation.
 
 ## Depth
 
@@ -64,4 +66,4 @@ DEPTH 0.7 (DEEP). Tested by the suite mirroring this module under `test/`.
 
 ## Referenced by
 
-[[src/PuduLangHttpClient]] · [[src/PuduLangHttpClient/Content]] · [[src/PuduLangHttpClient/Request]] · [[src/PuduLangHttpClient/Transport]] · [[src/PuduLangHttpClient/Transport/Connect]] · [[src/PuduLangHttpClient/Transport/Exchange]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Transport/Wire]] · [[src/PuduLangHttpClient/Transport/_MOC]]
+[[src/PuduLangHttpClient]] · [[src/PuduLangHttpClient/Content]] · [[src/PuduLangHttpClient/Request]] · [[src/PuduLangHttpClient/Transport]] · [[src/PuduLangHttpClient/Transport/Abort]] · [[src/PuduLangHttpClient/Transport/Connect]] · [[src/PuduLangHttpClient/Transport/Exchange]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Transport/Wire]] · [[src/PuduLangHttpClient/Transport/_MOC]]

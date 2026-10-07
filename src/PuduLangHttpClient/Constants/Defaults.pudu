@@ -43,6 +43,9 @@ export const READ_CHUNK: Int = 65536
 /// How long a request waiting for a free connection sleeps before it looks again, in milliseconds.
 export const POOL_WAIT_SLICE: Int = 2
 
+/// How often a request in flight looks for an explicit cancellation, in milliseconds.
+export const ABORT_POLL: Int = 10
+
 /// The port an http address uses when it names none.
 export const HTTP_PORT: Int = 80
 

@@ -5,6 +5,14 @@ tags: [changelog]
 
 # Changelog
 
+## 2026-10-07 — Placeholder service suite and mid-request cancellation (#5)
+
+- An explicit cancellation now closes the connection of a request in flight, waking a blocked read at
+  once ([[src/PuduLangHttpClient/Transport/Abort]], [[decisions/ADR-0004-deadline-cancellation]]).
+- Cancellations report the caller's own reason through the resilience handler and the stub.
+- A replica of the public placeholder REST service and suites exercising every CRUD verb on every
+  resource through the client, plus an opt-in live contract check ([[architecture/TESTING]]).
+
 ## 2026-10-06 — Initial release 0.1.0 (#1)
 
 - Released 0.1.0 as tag `v0.1.0` with a GitHub release; `pudu search` lists the package, and the

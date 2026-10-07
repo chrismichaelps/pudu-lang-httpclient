@@ -1,0 +1,59 @@
+/** @Transport.Abort.Module — a connection closed when its request is cancelled mid-exchange */
+module PuduLangHttpClient.Transport.Abort
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Concurrent as Concurrent
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Transport.Wire as Wire
+import PuduLangHttpClient.Utils.Shared as Shared
+
+/** @Transport.Abort.Stage — whether the exchange is running, finished, or was aborted */
+export type Stage = Running | Finished | Aborted
+
+/** @Transport.Abort.Guard — the stage one exchange is in, shared with its watcher */
+export type Guard = { stage: Shared.Shared[Stage] }
+
+/// A guard over an exchange on the link: a watcher closes the link as soon as the token is cancelled
+/// while the exchange runs, which wakes a read or write blocked on it.
+export fn watch(link: &Wire.Link, token: &Cancel.Token) -> Guard {
+  let guard = Guard{stage: Shared.shared(Running)}
+  let held = *link
+  let watched = *token
+  let _watching = Concurrent.start(fn() -> () {
+      var going = true
+      while going {
+        let _slept = Concurrent.sleep(Defaults.ABORT_POLL)
+        going = Shared.change(&guard.stage, fn(stage: Stage) -> (Stage, Bool) {
+            match stage {
+              case Running => {
+                if requested(&watched) {
+                  Wire.close(&held)
+                  (Aborted, false)
+                } else { (Running, true) }
+              }
+              case other => (other, false)
+            }
+          })
+      }
+    })
+  guard
+}
+
+/// Ends the exchange and answers whether the watcher aborted it; once this answers, the watcher never
+/// touches the link again.
+export fn finish(guard: &Guard) -> Bool {
+  Shared.change(&guard.stage, fn(stage: Stage) -> (Stage, Bool) {
+      match stage {
+        case Running => (Finished, false)
+        case other => (other, other == Aborted)
+      }
+    })
+}
+
+/// Whether the token was cancelled by request rather than by its deadline.
+fn requested(token: &Cancel.Token) -> Bool {
+  match Cancel.reason(token) {
+    case Some(Cancel.Requested(_)) => true
+    case _ => false
+  }
+}

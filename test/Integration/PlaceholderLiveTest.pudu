@@ -1,0 +1,94 @@
+/** @Test.Integration.PlaceholderLive.Suite — the replica checked against the public placeholder service */
+module Integration.PlaceholderLiveTest
+
+import Std.Env as Env
+import Std.Io as Io
+import Std.Json as Json
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory as Factory
+import PuduLangHttpClient.Handlers.Resilience as Resilience
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Transport as Transport
+import Support.Placeholder.Api as Api
+import Support.Placeholder.Server as Placeholder
+
+/// The public service the replica copies.
+const PUBLIC: Str = "https://jsonplaceholder.typicode.com/"
+
+/// How many records of each resource an API answers, in the replica's order.
+fn counts(api: &Api.Api) -> Array[Int] {
+  let sizes: Array[Result[Int, HttpClient.Failure]] = [
+    Result.map(Api.list[Api.Post](api, "posts", &[]), |items: Array[Api.Post]| items.length()),
+    Result.map(Api.list[Api.Comment](api, "comments", &[]), |items: Array[Api.Comment]| items.length()),
+    Result.map(Api.list[Api.Album](api, "albums", &[]), |items: Array[Api.Album]| items.length()),
+    Result.map(Api.list[Api.Photo](api, "photos", &[]), |items: Array[Api.Photo]| items.length()),
+    Result.map(Api.list[Api.Todo](api, "todos", &[]), |items: Array[Api.Todo]| items.length()),
+    Result.map(Api.list[Api.User](api, "users", &[]), |items: Array[Api.User]| items.length())
+  ]
+  sizes.map(|size: Result[Int, HttpClient.Failure]| Result.unwrapOr(size, -1))
+}
+
+/// The owners of a sample of records: post, comment, album, photo, and todo.
+fn owners(api: &Api.Api) -> Array[Int] {
+  [
+    Result.unwrapOr(Result.map(Api.find[Api.Post](api, "posts", 42), |p: Api.Post| p.userId), -1),
+    Result.unwrapOr(Result.map(Api.find[Api.Comment](api, "comments", 42), |c: Api.Comment| c.postId), -1),
+    Result.unwrapOr(Result.map(Api.find[Api.Album](api, "albums", 42), |a: Api.Album| a.userId), -1),
+    Result.unwrapOr(Result.map(Api.find[Api.Photo](api, "photos", 4242), |p: Api.Photo| p.albumId), -1),
+    Result.unwrapOr(Result.map(Api.find[Api.Todo](api, "todos", 142), |t: Api.Todo| t.userId), -1)
+  ]
+}
+
+/// The answers to one write of each kind: the new post's id, the replaced title, the patched title,
+/// and the removal's status.
+fn writes(api: &Api.Api) -> (Result[Int, HttpClient.Failure], Result[Str, HttpClient.Failure], Result[Str, HttpClient.Failure], Result[Int, HttpClient.Failure]) {
+  (
+    Result.map(Api.create(api, "posts", &Api.Post{userId: 1, id: 0, title: "new", body: "b"}), |p: Api.Post| p.id),
+    Result.map(Api.replace(api, "posts", 1, &Api.Post{userId: 1, id: 1, title: "replaced", body: "b"}), |p: Api.Post| p.title),
+    Result.map(Api.patch[Api.Post](api, "posts", 1, &Json.object(&[("title", Json.Text("patched"))])), |p: Api.Post| p.title),
+    Api.remove(api, "posts", 1)
+  )
+}
+
+/// Runs the suite against the public service when `PUDU_LIVE` is `1`, and skips every check otherwise.
+fn main() -> Int {
+  let live = Env.variableOr("PUDU_LIVE", "") == "1"
+  let reason = "set PUDU_LIVE=1 to check the replica against the public service"
+  let replica = Placeholder.start()
+  let local = Api.Api{client: Client.pooled(Transport.defaults()).withBaseAddress(replica.base + "/")}
+  let resilient = match Resilience.standard() {
+    case Ok(built) => built
+    case Err(_) => panic("the standard pipeline did not build")
+  }
+  let factory = match Factory.build([
+      Builder.named("public").withBaseAddress(PUBLIC).withTimeout(30000).withHandler(Resilience.handler(resilient)).configureTransport(|options: Transport.Options| options.withDecompression())
+    ]) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Factory.explain(&invalid))
+  }
+  let remote = Factory.typed(&factory, "public", |client: Client.Client| Api.Api{client: client})
+  let localCounts = counts(&local)
+  let localOwners = owners(&local)
+  let remoteCounts = if live { counts(&remote) } else { [] }
+  let remoteOwners = if live { owners(&remote) } else { [] }
+  let remoteWrites = if live { Some(writes(&remote)) } else { None }
+  let remoteUser: HttpClient.Outcome[Api.User] = if live { Api.find(&remote, "users", 1) } else { HttpClient.invalid("skipped") }
+  let localUser: HttpClient.Outcome[Api.User] = Api.find(&local, "users", 1)
+  Placeholder.stop(&replica)
+  Factory.dispose(&factory)
+  let checks = Test.suite("Integration.PlaceholderLive", &[
+      Test.equals("the replica holds the public service's counts and owners", &(localCounts, localOwners), &([100, 500, 100, 5000, 200, 10], [5, 9, 5, 85, 8])),
+      Test.skipIf(!live, reason, &Test.equals("the public service holds the replica's counts", &remoteCounts, &localCounts)),
+      Test.skipIf(!live, reason, &Test.equals("records belong to the same owners in both", &remoteOwners, &localOwners)),
+      Test.skipIf(!live, reason, &Test.equals("the first user is the same person in both", &Result.map(remoteUser, |u: Api.User| (u.username, u.address.geo, u.company.name)), &Result.map(localUser, |u: Api.User| (u.username, u.address.geo, u.company.name)))),
+      Test.skipIf(!live, reason, &Test.equals("the public service answers every write the replica supports", &remoteWrites, &Some((Ok(101), Ok("replaced"), Ok("patched"), Ok(200)))))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

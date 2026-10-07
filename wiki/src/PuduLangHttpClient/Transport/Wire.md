@@ -40,7 +40,7 @@ export fn close(link: &Link) -> ()
 ### Linkage
 
 - **Requires:** [[src/PuduLangHttpClient]], [[src/PuduLangHttpClient/Constants/Defaults]], [[src/PuduLangHttpClient/Domain/Expiry]], the standard library.
-- **Consumed by:** [[src/PuduLangHttpClient/Transport]], [[src/PuduLangHttpClient/Transport/Connect]], [[src/PuduLangHttpClient/Transport/Exchange]], [[src/PuduLangHttpClient/Transport/Hop]], [[src/PuduLangHttpClient/Transport/Pool]].
+- **Consumed by:** [[src/PuduLangHttpClient/Transport]], [[src/PuduLangHttpClient/Transport/Abort]], [[src/PuduLangHttpClient/Transport/Connect]], [[src/PuduLangHttpClient/Transport/Exchange]], [[src/PuduLangHttpClient/Transport/Hop]], [[src/PuduLangHttpClient/Transport/Pool]].
 
 ## Algorithm
 
@@ -66,4 +66,4 @@ DEPTH 0.7 (DEEP). Tested by the suite mirroring this module under `test/`.
 
 ## Referenced by
 
-[[decisions/ADR-0004-deadline-cancellation]] · [[src/PuduLangHttpClient]] · [[src/PuduLangHttpClient/Constants/Defaults]] · [[src/PuduLangHttpClient/Domain/Expiry]] · [[src/PuduLangHttpClient/Transport]] · [[src/PuduLangHttpClient/Transport/Connect]] · [[src/PuduLangHttpClient/Transport/Exchange]] · [[src/PuduLangHttpClient/Transport/Hop]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Transport/_MOC]]
+[[decisions/ADR-0004-deadline-cancellation]] · [[src/PuduLangHttpClient]] · [[src/PuduLangHttpClient/Constants/Defaults]] · [[src/PuduLangHttpClient/Domain/Expiry]] · [[src/PuduLangHttpClient/Transport]] · [[src/PuduLangHttpClient/Transport/Abort]] · [[src/PuduLangHttpClient/Transport/Connect]] · [[src/PuduLangHttpClient/Transport/Exchange]] · [[src/PuduLangHttpClient/Transport/Hop]] · [[src/PuduLangHttpClient/Transport/Pool]] · [[src/PuduLangHttpClient/Transport/_MOC]]

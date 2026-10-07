@@ -5,6 +5,7 @@ tags: [moc]
 
 # PuduLangHttpClient.Transport
 
+- [[src/PuduLangHttpClient/Transport/Abort]] — A connection closed when its request is cancelled mid-exchange, so a read or write blocked on it wakes at once.
 - [[src/PuduLangHttpClient/Transport/Connect]] — Routes chosen per endpoint and connections opened directly or through a proxy, within a connect timeout.
 - [[src/PuduLangHttpClient/Transport/Exchange]] — One request written and one response read over a connection: interim responses skipped, the head parsed, and the body read by its framing, buffered or streamed.
 - [[src/PuduLangHttpClient/Transport/Hop]] — One request sent over a pooled connection, retried once on a new connection when a reused one turns out to have been closed while idle.

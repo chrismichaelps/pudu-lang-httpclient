@@ -7,6 +7,7 @@ import Std.Result as Result
 import PuduLangHttpClient.Content as Content
 import PuduLangHttpClient as HttpClient
 import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Transport.Abort as Abort
 import PuduLangHttpClient.Transport.Connect as Connect
 import PuduLangHttpClient.Transport.Exchange as Exchange
 import PuduLangHttpClient.Transport.Pool as Pool
@@ -27,7 +28,9 @@ export type Sending = {
 
 /// The response to one request along the route, over a pooled connection when one is idle; a
 /// reused connection that fails before any of the response arrived was closed by the server while
-/// idle, and the request is sent once more over a new connection unless its body was streamed.
+/// idle, and the request is sent once more over a new connection unless its body was streamed. A
+/// request cancelled mid-exchange has its connection closed and answers a stall the transport
+/// reports as the cancellation.
 export fn send(pool: &Pool.Pool, route: &Connect.Route, sending: &Sending, token: &Cancel.Token) -> Result[Exchange.Exchanged, Wire.Fault] {
   let first = attempt(pool, route, sending, token)
   let outcome = match first {
@@ -56,7 +59,13 @@ fn attempt(pool: &Pool.Pool, route: &Connect.Route, sending: &Sending, token: &C
       }
     }
   }
-  match Exchange.exchange(&link, &sending.written, &sending.method, &sending.headers, &sending.reading, sending.deadline, sending.receiver, sending.following, sending.upload) {
+  let guard = Abort.watch(&link, token)
+  let outcome = Exchange.exchange(&link, &sending.written, &sending.method, &sending.headers, &sending.reading, sending.deadline, sending.receiver, sending.following, sending.upload)
+  if Abort.finish(&guard) {
+    Pool.release(pool, route.key, link, created, false)
+    return Err((Wire.Stalled, false))
+  }
+  match outcome {
     case Ok(exchanged) => {
       Pool.release(pool, route.key, link, created, exchanged.reusable)
       Ok(exchanged)
