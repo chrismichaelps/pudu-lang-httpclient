@@ -5,6 +5,11 @@ tags: [changelog]
 
 # Changelog
 
+## 2026-10-07 — Release 0.1.1 (#5)
+
+- Released 0.1.1 as tag `v0.1.1` with a GitHub release: mid-request cancellation and the
+  placeholder end-to-end suite.
+
 ## 2026-10-07 — Placeholder service suite and mid-request cancellation (#5)
 
 - An explicit cancellation now closes the connection of a request in flight, waking a blocked read at
