@@ -1,0 +1,130 @@
+/** @Transport.Wire.Module — one open connection, plain or secured, bounded by a deadline */
+module PuduLangHttpClient.Transport.Wire
+
+import Std.Net as Net
+import Std.Tls as Tls
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Domain.Expiry as Expiry
+import PuduLangHttpClient as HttpClient
+
+/** @Transport.Wire.Link — an open connection */
+export type Link = Plain(Net.Connection) | Secured(Tls.Secured)
+
+/** @Transport.Wire.Fault — why an operation on a connection did not finish */
+export type Fault = Stalled | Ended | Broken(HttpClient.Failure)
+
+/// Milliseconds an operation may wait under a deadline, `Defaults.INFINITE` for none; `None` once
+/// the deadline has passed.
+export fn budget(deadline: Option[Int]) -> Option[Int] {
+  match Expiry.remaining(deadline, clock()) {
+    case Some(0) => None
+    case Some(left) => Some(left)
+    case None => Some(Defaults.INFINITE)
+  }
+}
+
+/// A plain connection to a host and port.
+export fn dial(host: Str, port: Int, deadline: Option[Int]) -> Result[Link, Fault] {
+  let millis = budget(deadline)
+  match millis {
+    case None => Err(Stalled)
+    case Some(left) => {
+      match Net.connectWithin(host, port, left) {
+        case Ok(connection) => Ok(Plain(connection))
+        case Err(problem) => Err(plainFault(&problem))
+      }
+    }
+  }
+}
+
+/// A plain connection secured for a host whose certificate must verify.
+export fn secure(link: Link, host: Str, deadline: Option[Int]) -> Result[Link, Fault] {
+  match (link, budget(deadline)) {
+    case (Plain(connection), Some(left)) => {
+      match Tls.upgradeWithin(&connection, host, left) {
+        case Ok(secured) => Ok(Secured(secured))
+        case Err(problem) => Err(securedFault(&problem))
+      }
+    }
+    case (Plain(connection), None) => {
+      let _closed = Net.close(&connection)
+      Err(Stalled)
+    }
+    case (secured, _) => Ok(secured)
+  }
+}
+
+/// Writes every byte.
+export fn write(link: &Link, payload: &Bytes, deadline: Option[Int]) -> Result[(), Fault] {
+  let left = match budget(deadline) {
+    case Some(found) => found
+    case None => { return Err(Stalled) }
+  }
+  match link {
+    case Plain(connection) => {
+      match Net.sendWithin(&connection, payload, left) {
+        case Ok(_) => Ok(())
+        case Err(problem) => Err(plainFault(&problem))
+      }
+    }
+    case Secured(connection) => {
+      match Tls.sendWithin(&connection, payload, left) {
+        case Ok(_) => Ok(())
+        case Err(problem) => Err(securedFault(&problem))
+      }
+    }
+  }
+}
+
+/// The next bytes that arrive, or `None` once the other side closed.
+export fn read(link: &Link, deadline: Option[Int]) -> Result[Option[Bytes], Fault] {
+  let left = match budget(deadline) {
+    case Some(found) => found
+    case None => { return Err(Stalled) }
+  }
+  match link {
+    case Plain(connection) => {
+      match Net.receiveWithin(&connection, Defaults.READ_CHUNK, left) {
+        case Ok(piece) => Ok(piece)
+        case Err(Net.Closed) => Ok(None)
+        case Err(problem) => Err(plainFault(&problem))
+      }
+    }
+    case Secured(connection) => {
+      match Tls.receiveWithin(&connection, Defaults.READ_CHUNK, left) {
+        case Ok(piece) => Ok(piece)
+        case Err(Tls.Closed) => Ok(None)
+        case Err(problem) => Err(securedFault(&problem))
+      }
+    }
+  }
+}
+
+/// Closes the connection, ignoring a failure: a connection being given up on has nothing left to say.
+export fn close(link: &Link) -> () {
+  match link {
+    case Plain(connection) => { let _closed = Net.close(&connection) }
+    case Secured(connection) => { let _closed = Tls.closeWithin(&connection, 1000) }
+  }
+}
+
+/// The failure a plain socket's error stands for.
+fn plainFault(problem: &Net.NetError) -> Fault {
+  match problem {
+    case Net.NetOperationTimedOut => Stalled
+    case Net.Closed => Ended
+    case Net.Unresolved(reason) => Broken(HttpClient.NameResolution(reason))
+    case other => Broken(HttpClient.Connection(show(other)))
+  }
+}
+
+/// The failure a secured socket's error stands for.
+fn securedFault(problem: &Tls.TlsError) -> Fault {
+  match problem {
+    case Tls.TlsOperationTimedOut => Stalled
+    case Tls.Closed => Ended
+    case Tls.Unresolved(reason) => Broken(HttpClient.NameResolution(reason))
+    case Tls.Refused(reason) => Broken(HttpClient.Connection(reason))
+    case other => Broken(HttpClient.SecureConnection(show(other)))
+  }
+}

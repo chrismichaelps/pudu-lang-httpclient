@@ -1,0 +1,88 @@
+/** @HttpClient.Endpoint.Module — declarative endpoints: a method and an address template */
+module PuduLangHttpClient.Endpoint
+
+import Std.Char as Char
+import Std.Http as Http
+import Std.Json as Json
+import Std.Text as Text
+import Std.Url as Url
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Utils.Template as Template
+
+/** @HttpClient.Endpoint.Endpoint — a method and an address whose `:name` slots are filled per call */
+export type Endpoint = { method: Http.Method, template: Str }
+
+/// The media type endpoint calls ask for.
+const ACCEPT_JSON: Str = "application/json"
+
+/// A `GET` endpoint.
+export fn get(template: Str) -> Endpoint { Endpoint{method: Http.Get, template: template} }
+
+/// A `POST` endpoint.
+export fn post(template: Str) -> Endpoint { Endpoint{method: Http.Post, template: template} }
+
+/// A `PUT` endpoint.
+export fn put(template: Str) -> Endpoint { Endpoint{method: Http.Put, template: template} }
+
+/// A `PATCH` endpoint.
+export fn patch(template: Str) -> Endpoint { Endpoint{method: Http.Patch, template: template} }
+
+/// A `DELETE` endpoint.
+export fn delete(template: Str) -> Endpoint { Endpoint{method: Http.Delete, template: template} }
+
+/// The address with every `:name` slot replaced by its argument, percent-encoded as a component; a
+/// slot is a colon followed by a letter and then letters, digits, or underscores, and a slot without
+/// an argument is refused.
+export fn fill(endpoint: &Endpoint, arguments: &Array[(Str, Str)]) -> HttpClient.Outcome[Str] {
+  var out = ""
+  var rest = endpoint.template
+  loop {
+    match Text.find(rest, ":") {
+      case None => { return Ok(out + rest) }
+      case Some(colon) => {
+        let after = rest.drop(colon + 1)
+        let name = Text.takeWhile(after, |c: Char| Char.isAlphanumeric(c) || c == '_')
+        if name.isEmpty() || !Char.isLetter(name.chars()[0]) {
+          out = out + rest.slice(0, colon + 1)
+          rest = after
+        } else {
+          let value = match arguments.filter(|pair: (Str, Str)| pair[0] == name) {
+            case [first, ..] => first[1]
+            case _ => { return HttpClient.invalid(Template.fill(Messages.UNFILLED_SLOT, &[name])) }
+          }
+          out = out + rest.slice(0, colon) + Url.encodeComponent(value)
+          rest = after.drop(name.length())
+        }
+      }
+    }
+  }
+}
+
+/// The request an endpoint makes with its arguments through the client, asking for JSON.
+export fn request(client: &Client.Client, endpoint: &Endpoint, arguments: &Array[(Str, Str)]) -> HttpClient.Outcome[Request.Request] {
+  let uri = fill(endpoint, arguments) ?
+  Ok(Client.build(client, endpoint.method, uri).withHeader("accept", ACCEPT_JSON))
+}
+
+/// The response to calling the endpoint through the client, whatever its status.
+export fn send(client: &Client.Client, endpoint: &Endpoint, arguments: &Array[(Str, Str)]) -> HttpClient.Outcome[Response.Response] {
+  Client.send(client, request(client, endpoint, arguments) ?)
+}
+
+/// The value a successful call answers, read from JSON.
+export fn call[T: Json.Decode](client: &Client.Client, endpoint: &Endpoint, arguments: &Array[(Str, Str)]) -> HttpClient.Outcome[T] {
+  let response = Response.ensureSuccess(send(client, endpoint, arguments) ?) ?
+  Response.readAs(&response)
+}
+
+/// The value a successful call carrying `body` as JSON answers, read from JSON.
+export fn callWith[B: Json.Encode, T: Json.Decode](client: &Client.Client, endpoint: &Endpoint, arguments: &Array[(Str, Str)], body: &B) -> HttpClient.Outcome[T] {
+  let made = request(client, endpoint, arguments) ?
+  let response = Response.ensureSuccess(Client.send(client, made.withContent(Content.jsonOf(body))) ?) ?
+  Response.readAs(&response)
+}

@@ -1,0 +1,38 @@
+/** @Test.Root.Suite — failures, their descriptions, and their kinds */
+module PuduLangHttpClientTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient as HttpClient
+
+/// One failure of every kind.
+const EVERY: Array[HttpClient.Failure] = [
+  HttpClient.InvalidRequest("r"), HttpClient.NameResolution("n"), HttpClient.Connection("c"), HttpClient.SecureConnection("s"),
+  HttpClient.ProxyTunnel("p"), HttpClient.Protocol("x"), HttpClient.ResponseEnded, HttpClient.ContentTooLarge(1),
+  HttpClient.HeadersTooLarge(2), HttpClient.TooManyRedirects(3), HttpClient.NotPermitted("np"), HttpClient.VersionUnsupported("HTTP/2"),
+  HttpClient.TimedOut(4), HttpClient.Cancelled("why"), HttpClient.Unsuccessful(404, "Not Found"), HttpClient.Unreadable("u"),
+  HttpClient.Rejected("open"), HttpClient.Crashed("boom")
+]
+
+/// Runs the suite.
+fn main() -> Int {
+  let checks = Test.suite("Root", &[
+      Test.equals("transient failures are the ones a retry may cure", &EVERY.filter(|failure: HttpClient.Failure| HttpClient.isTransient(&failure)), &[HttpClient.NameResolution("n"), HttpClient.Connection("c"), HttpClient.ProxyTunnel("p"), HttpClient.Protocol("x"), HttpClient.ResponseEnded, HttpClient.TimedOut(4)]),
+      Test.equals("only a cancellation is one", &EVERY.filter(|failure: HttpClient.Failure| HttpClient.isCancellation(&failure)), &[HttpClient.Cancelled("why")]),
+      Test.equals("only a timeout is one", &EVERY.filter(|failure: HttpClient.Failure| HttpClient.isTimeout(&failure)), &[HttpClient.TimedOut(4)]),
+      Test.equals("only an unsuccessful status reports its code", &EVERY.map(|failure: HttpClient.Failure| HttpClient.statusOf(&failure)).filter(|code: Option[Int]| code != None), &[Some(404)]),
+      Test.equals("every failure is described in its own words", &EVERY.map(|failure: HttpClient.Failure| HttpClient.describe(&failure)), &[
+          "The request is invalid: r", "The host name could not be resolved: n", "The connection failed: c", "The secured connection failed: s",
+          "The proxy did not open a tunnel: p", "The response broke the protocol: x", "The connection closed before the response was complete.", "The response body is larger than 1 bytes.",
+          "The response headers are larger than 2 bytes.", "The request was redirected more than 3 times.", "The destination is not permitted: np", "The request asks for HTTP/2, which the transport does not speak.",
+          "The request timed out after 4 ms.", "The request was cancelled: why", "The response status 404 (Not Found) does not indicate success.", "The body could not be read: u",
+          "The request was rejected: open", "A handler stopped its thread: boom"
+        ]),
+      Test.equals("an invalid outcome is an invalid request", &HttpClient.invalid("bad"), &Err[Int, HttpClient.Failure](HttpClient.InvalidRequest("bad")))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

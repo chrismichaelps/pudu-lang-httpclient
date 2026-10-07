@@ -1,0 +1,25 @@
+/** @Test.Events.Suite — events described, listeners added, and events written as JSON */
+module PuduLangHttpClient.EventsTest
+
+import Std.Io as Io
+import Std.Json as Json
+import Std.Test as Test
+import PuduLangHttpClient.Events as Events
+
+/// Runs the suite.
+fn main() -> Int {
+  let none = Events.listeners()
+  let some = none.onRequestStarted(|_event: Events.RequestStarted| ()).onRequestCompleted(|_event: Events.RequestCompleted| ()).onRequestFailed(|_event: Events.RequestFailed| ()).onPipelineChanged(|_event: Events.PipelineChanged| ())
+  let checks = Test.suite("Events", &[
+      Test.equals("listeners are added per kind", &(some.started.length(), some.completed.length(), some.failed.length(), some.changed.length()), &(1, 1, 1, 1)),
+      Test.not("no listeners hear no requests", Events.hearsRequests(&none)),
+      Test.not("a pipeline listener hears no requests", Events.hearsRequests(&none.onPipelineChanged(|_event: Events.PipelineChanged| ()))),
+      Test.that("any request listener hears requests", Events.hearsRequests(&none.onRequestStarted(|_event: Events.RequestStarted| ())) && Events.hearsRequests(&none.onRequestCompleted(|_event: Events.RequestCompleted| ())) && Events.hearsRequests(&none.onRequestFailed(|_event: Events.RequestFailed| ()))),
+      Test.equals("events write themselves as JSON", &(Json.encode(&Events.RequestCompleted{client: "api", method: "GET", uri: "http://a/", status: 200, elapsed: 3}.encode()), Json.encode(&Events.PipelineChanged{client: "api", generation: 2, stage: Events.Expired}.encode())), &("\{\"client\":\"api\",\"method\":\"GET\",\"uri\":\"http://a/\",\"status\":200,\"elapsed\":3\}", "\{\"client\":\"api\",\"generation\":2,\"stage\":\{\"Expired\":[]\}\}"))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

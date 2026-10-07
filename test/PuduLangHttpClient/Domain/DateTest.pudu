@@ -1,0 +1,33 @@
+/** @Test.Domain.Date.Suite — HTTP dates read as Unix milliseconds */
+module PuduLangHttpClient.Domain.DateTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Domain.Date as Date
+
+/// The instant the specification's example date names.
+const EXAMPLE: Int = 784111777000
+
+/// Runs the suite.
+fn main() -> Int {
+  let checks = Test.suite("Domain.Date", &[
+      Test.equals("the preferred form is read", &Date.parse("Sun, 06 Nov 1994 08:49:37 GMT"), &Some(EXAMPLE)),
+      Test.equals("the obsolete form with a two-digit year is read", &Date.parse("Sunday, 06-Nov-94 08:49:37 GMT"), &Some(EXAMPLE)),
+      Test.equals("the C library form is read", &Date.parse("Sun Nov  6 08:49:37 1994"), &Some(EXAMPLE)),
+      Test.equals("the epoch is zero", &Date.parse("Thu, 01 Jan 1970 00:00:00 GMT"), &Some(0)),
+      Test.equals("a leap day is counted", &Date.parse("Thu, 29 Feb 2024 12:00:00 GMT"), &Some(1709208000000)),
+      Test.equals("the first of March after a leap day follows it", &Date.parse("Fri, 01 Mar 2024 00:00:00 GMT"), &Some(1709251200000)),
+      Test.equals("the last second of a year is read", &Date.parse("Fri, 31 Dec 1999 23:59:59 GMT"), &Some(946684799000)),
+      Test.equals("a two-digit year of 69 is in this century and 70 in the last", &(Date.parse("01-Jan-69 00:00:00"), Date.parse("01-Jan-70 00:00:00")), &(Some(3124224000000), Some(0))),
+      Test.equals("a missing part reads nothing", &[Date.parse("06 Nov 1994"), Date.parse("Nov 1994 08:49:37"), Date.parse("06 1994 08:49:37"), Date.parse("06 Nov 08:49:37"), Date.parse("")], &[None, None, None, None, None]),
+      Test.equals("an impossible day or time reads nothing", &[Date.parse("32 Nov 1994 00:00:00"), Date.parse("00 Nov 1994 00:00:00"), Date.parse("06 Nov 1994 24:00:00"), Date.parse("06 Nov 1994 23:60:00"), Date.parse("06 Nov 1994 23:59:61"), Date.parse("06 Nov 1994 1:2"), Date.parse("06 Nov 1994 ab:00:00")], &[None, None, None, None, None, None, None]),
+      Test.equals("the extremes of a day and a time are read", &(Date.parse("31 Jan 1970 23:59:60"), Date.parse("01 Jan 1970 00:00:00")), &(Some(2678400000), Some(0))),
+      Test.equals("a year before 1601 reads nothing", &(Date.parse("01 Jan 1600 00:00:00"), Date.parse("01 Jan 1601 00:00:00")), &(None, Some(-11644473600000))),
+      Test.equals("month names ignore case", &Date.parse("06 NOV 1994 08:49:37"), &Some(EXAMPLE))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

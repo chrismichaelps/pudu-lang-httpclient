@@ -1,0 +1,152 @@
+/** @HttpClient.Content.Module — message bodies and the headers describing them */
+module PuduLangHttpClient.Content
+
+import Std.Bytes as ByteSeq
+import Std.Http as Http
+import Std.Json as Json
+import Std.Random as Random
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Utils.Template as Template
+
+/** @HttpClient.Content.Producer — the next piece of a streamed body, or `None` once it ends */
+export type Producer = fn() -> Option[Bytes]
+
+/** @HttpClient.Content.Content — a body's bytes, or the producer streaming it, and its content headers */
+export type Content = { payload: Bytes, headers: Array[(Str, Str)], stream: Option[Producer] }
+
+/** @HttpClient.Content.Part — one field or file of a multipart body */
+export type Part = { name: Str, filename: Option[Str], mediaType: Option[Str], payload: Bytes }
+
+/// The media type of text bodies when none is named.
+const TEXT_PLAIN: Str = "text/plain; charset=utf-8"
+
+/// The media type of JSON bodies.
+const APPLICATION_JSON: Str = "application/json; charset=utf-8"
+
+/// The media type of form bodies.
+const FORM: Str = "application/x-www-form-urlencoded"
+
+/// The media type of bodies whose bytes have no stated meaning.
+const OCTET_STREAM: Str = "application/octet-stream"
+
+/// The line break multipart framing uses.
+const CRLF: Str = "\r\n"
+
+/// A body with no bytes and no headers.
+export fn empty() -> Content { Content{payload: ByteSeq.empty(), headers: [], stream: None} }
+
+/// UTF-8 text of the given media type, to which `; charset=utf-8` is added when it names no charset.
+export fn text(body: Str, mediaType: Str) -> Content {
+  let typed = if mediaType.toLower().contains("charset=") { mediaType } else { mediaType + "; charset=utf-8" }
+  Content{payload: body.toBytes(), headers: [("content-type", typed)], stream: None}
+}
+
+/// UTF-8 plain text.
+export fn plain(body: Str) -> Content { Content{payload: body.toBytes(), headers: [("content-type", TEXT_PLAIN)], stream: None} }
+
+/// Bytes of the given media type.
+export fn bytes(payload: &Bytes, mediaType: Str) -> Content { Content{payload: *payload, headers: [("content-type", mediaType)], stream: None} }
+
+/// Bytes with no stated meaning.
+export fn octets(payload: &Bytes) -> Content { bytes(payload, OCTET_STREAM) }
+
+/// A JSON document.
+export fn json(value: &Json.Json) -> Content {
+  Content{payload: Json.encode(value).toBytes(), headers: [("content-type", APPLICATION_JSON)], stream: None}
+}
+
+/// Any value that writes itself as JSON.
+export fn jsonOf[T: Json.Encode](value: &T) -> Content { json(&value.encode()) }
+
+/// Fields encoded as an HTML form.
+export fn form(fields: &Array[(Str, Str)]) -> Content {
+  Content{payload: Http.renderForm(fields).toBytes(), headers: [("content-type", FORM)], stream: None}
+}
+
+/// A body of the given media type streamed from a producer as it is sent, in chunks, instead of
+/// being held whole; it can be sent once, and it is not repeated after a redirect.
+export fn streamed(mediaType: Str, producer: Producer) -> Content {
+  Content{payload: ByteSeq.empty(), headers: [("content-type", mediaType)], stream: Some(producer)}
+}
+
+/// Whether the body is streamed from a producer.
+export fn isStreamed(content: &Content) -> Bool { content.stream != None }
+
+/// A text field of a multipart body.
+export fn field(name: Str, value: Str) -> Part { Part{name: name, filename: None, mediaType: None, payload: value.toBytes()} }
+
+/// A file of a multipart body.
+export fn file(name: Str, filename: Str, mediaType: Str, payload: &Bytes) -> Part {
+  Part{name: name, filename: Some(filename), mediaType: Some(mediaType), payload: *payload}
+}
+
+/// The parts as a `multipart/form-data` body separated by a random boundary.
+export fn multipart(parts: &Array[Part]) -> Content {
+  let random = match Random.secureBytes(16) {
+    case Ok(found) => ByteSeq.encodeHex(&found)
+    case Err(_) => show(clock())
+  }
+  multipartWith("pudu-" + random, parts)
+}
+
+/// The parts as a `multipart/form-data` body separated by the given boundary.
+export fn multipartWith(boundary: Str, parts: &Array[Part]) -> Content {
+  var pieces: Array[Bytes] = []
+  for part in parts {
+    var head = "--" + boundary + CRLF + "content-disposition: form-data; name=\"" + quoted(part.name) + "\""
+    if let Some(filename) = part.filename { head = head + "; filename=\"" + quoted(filename) + "\"" }
+    head = head + CRLF
+    if let Some(mediaType) = part.mediaType { head = head + "content-type: " + mediaType + CRLF }
+    pieces = pieces.push((head + CRLF).toBytes()).push(part.payload).push(CRLF.toBytes())
+  }
+  pieces = pieces.push(("--" + boundary + "--" + CRLF).toBytes())
+  Content{payload: ByteSeq.join(&pieces), headers: [("content-type", "multipart/form-data; boundary=" + boundary)], stream: None}
+}
+
+/// The body with a content header set, replacing any value it had.
+export fn withHeader(content: &Content, name: Str, value: Str) -> Content {
+  Content{..*content, headers: Headers.set(&content.headers, name, value)}
+}
+
+/// The media type the body states, without parameters.
+export fn mediaTypeOf(content: &Content) -> Option[Str] { Http.mediaType(&content.headers) }
+
+/// The number of bytes in the body.
+export fn length(content: &Content) -> Int { content.payload.length() }
+
+/// The body as UTF-8 text.
+export fn readText(content: &Content) -> HttpClient.Outcome[Str] {
+  match ByteSeq.toText(&content.payload) {
+    case Ok(found) => Ok(found)
+    case Err(_) => Err(HttpClient.Unreadable(Messages.NOT_TEXT))
+  }
+}
+
+/// The body as a JSON document.
+export fn readJson(content: &Content) -> HttpClient.Outcome[Json.Json] {
+  let source = readText(content) ?
+  match Json.decode(source) {
+    case Ok(value) => Ok(value)
+    case Err(problem) => Err(HttpClient.Unreadable(Template.fill(Messages.NOT_JSON, &[Json.explain(&problem)])))
+  }
+}
+
+/// The body as a value that reads itself from JSON.
+export fn readAs[T: Json.Decode](content: &Content) -> HttpClient.Outcome[T] {
+  let value = readJson(content) ?
+  match T.decode(&value) {
+    case Ok(found) => Ok(found)
+    case Err(problem) => Err(HttpClient.Unreadable(Template.fill(Messages.NOT_DECODABLE, &[Json.explainDecode(&problem)])))
+  }
+}
+
+/// The body as the fields of an HTML form.
+export fn readForm(content: &Content) -> HttpClient.Outcome[Array[(Str, Str)]] {
+  let source = readText(content) ?
+  Ok(Http.parseForm(source))
+}
+
+/// A name or file name with the characters that would end its quotes escaped.
+fn quoted(value: Str) -> Str { value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", "").replace("\n", "") }

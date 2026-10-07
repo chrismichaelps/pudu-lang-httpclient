@@ -1,0 +1,18 @@
+/** @Utils.Tokens.Module — cancellation tokens that fire when any of several does */
+module PuduLangHttpClient.Utils.Tokens
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Sync as Sync
+import PuduLangHttpClient.Constants.Defaults as Defaults
+
+/// A token that fires when any parent fires, or `millis` from now unless `millis` is
+/// `Defaults.INFINITE`, whichever comes first; cancelling it leaves the parents running.
+export fn linked(parents: &Array[Cancel.Token], millis: Int) -> Cancel.Token {
+  var ancestors: Array[Sync.Cell[Option[Cancel.Reason]]] = []
+  var deadline = if millis == Defaults.INFINITE { Defaults.INFINITE } else { clock() + (if millis < 0 { 0 } else { millis }) }
+  for parent in parents {
+    ancestors = ancestors.concat(parent.ancestors).push(parent.own)
+    if parent.deadline != Defaults.INFINITE && (deadline == Defaults.INFINITE || parent.deadline < deadline) { deadline = parent.deadline }
+  }
+  Cancel.Token{own: Sync.cell(None), guard: Sync.mutex(), ancestors: ancestors, deadline: deadline}
+}

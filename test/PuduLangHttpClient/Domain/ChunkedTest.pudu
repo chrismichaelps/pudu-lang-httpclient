@@ -1,0 +1,66 @@
+/** @Test.Domain.Chunked.Suite — chunked bodies decoded as their bytes arrive */
+module PuduLangHttpClient.Domain.ChunkedTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Domain.Chunked as Chunked
+
+/// The decoder and every decoded byte after feeding each piece in turn, or the problem.
+fn fed(pieces: &Array[Str], limit: Int) -> Result[(Chunked.Decoder, Str), Chunked.Problem] {
+  var decoder = Chunked.decoder()
+  var body = ""
+  for piece in pieces {
+    let (next, decoded) = Chunked.feed(&decoder, &piece.toBytes(), limit) ?
+    decoder = next
+    body = body + textOf(&decoded)
+  }
+  Ok((decoder, body))
+}
+
+/// Text from bytes that are text, or empty text.
+fn textOf(bytes: &Bytes) -> Str {
+  match bytes.toText() {
+    case Some(text) => text
+    case None => ""
+  }
+}
+
+/// The body decoded, whether decoding finished, the trailers, and what was left over.
+fn summary(pieces: &Array[Str], limit: Int) -> Result[(Str, Bool, Array[(Str, Str)], Str), Chunked.Problem] {
+  let (decoder, body) = fed(pieces, limit) ?
+  Ok((body, Chunked.isDone(&decoder), decoder.trailers, textOf(&Chunked.leftover(&decoder))))
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let whole = "4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n"
+  let pieces = whole.chars().map(|c: Char| c.toText())
+  let checks = Test.suite("Domain.Chunked", &[
+      Test.equals("a whole body decodes", &summary(&[whole], 100), &Ok(("Wikipedia in\r\n\r\nchunks.", true, [], ""))),
+      Test.equals("a body arriving one character at a time decodes the same", &summary(&pieces, 100), &Ok(("Wikipedia in\r\n\r\nchunks.", true, [], ""))),
+      Test.equals("extensions are ignored and trailers kept", &summary(&["3;name=v\r\nabc\r\n0\r\nExpires: never\r\nX-A:  b \r\n\r\n"], 100), &Ok(("abc", true, [("Expires", "never"), ("X-A", "b")], ""))),
+      Test.equals("bytes after the body are left over", &summary(&["1\r\nx\r\n0\r\n\r\nHTTP"], 100), &Ok(("x", true, [], "HTTP"))),
+      Test.equals("an unfinished body is not done", &summary(&["5\r\nab"], 100), &Ok(("ab", false, [], ""))),
+      Test.equals("an empty body is done at once", &summary(&["0\r\n\r\n"], 0), &Ok(("", true, [], ""))),
+      Test.equals("a body exactly at the limit decodes", &summary(&["3\r\nabc\r\n0\r\n\r\n"], 3), &Ok(("abc", true, [], ""))),
+      Test.equals("a body one byte over the limit is exceeded", &summary(&["4\r\nabcd\r\n0\r\n\r\n"], 3), &Err(Chunked.Exceeded)),
+      Test.equals("upper-case hexadecimal sizes are read", &summary(&["A\r\n0123456789\r\n0\r\n\r\n"], 100), &Ok(("0123456789", true, [], ""))),
+      Test.equals("a size that is not hexadecimal is malformed", &summary(&["xyz\r\n"], 100), &Err(Chunked.Malformed("a chunk size is not hexadecimal: xyz"))),
+      Test.equals("an empty size is malformed", &summary(&[";x\r\n"], 100), &Err(Chunked.Malformed("a chunk size is missing or too long"))),
+      Test.equals("a size of sixteen digits is malformed", &summary(&["1000000000000000\r\n"], 100), &Err(Chunked.Malformed("a chunk size is missing or too long"))),
+      Test.equals("a chunk not followed by a line break is malformed", &summary(&["1\r\nxyz"], 100), &Err(Chunked.Malformed("a chunk is not followed by a line break"))),
+      Test.equals("a trailer without a name is malformed", &summary(&["0\r\n: v\r\n\r\n"], 100), &Err(Chunked.Malformed("a trailer field has no name"))),
+      Test.equals("a framing line past the limit is malformed", &summary(&["1".repeat(8193)], 100), &Err(Chunked.Malformed("a framing line is longer than 8192 bytes"))),
+      Test.equals("a long line with its break is malformed too", &summary(&["0;" + "x".repeat(8191) + "\r\n"], 100), &Err(Chunked.Malformed("a framing line is longer than 8192 bytes"))),
+      Test.equals("a line at the limit is accepted", &summary(&["0;" + "x".repeat(8190) + "\r\n\r\n"], 100), &Ok(("", true, [], ""))),
+      Test.equals("an unfinished line exactly at the limit waits for more", &summary(&["1".repeat(8192)], 100), &Ok(("", false, [], ""))),
+      Test.equals("a size of fifteen digits is read", &summary(&["00000000000000A\r\n0123456789\r\n0\r\n\r\n"], 100), &Ok(("0123456789", true, [], ""))),
+      Test.equals("a trailer name of one letter is a name", &summary(&["0\r\nX:1\r\n\r\n"], 100), &Ok(("", true, [("X", "1")], ""))),
+      Test.equals("nothing is left over before the end", &textOf(&Chunked.leftover(&Chunked.decoder())), &"")
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

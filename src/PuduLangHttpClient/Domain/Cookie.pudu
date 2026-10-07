@@ -1,0 +1,150 @@
+/** @Domain.Cookie.Module — cookies read from responses and matched to requests */
+module PuduLangHttpClient.Domain.Cookie
+
+import Std.Json as Json
+import Std.Math as Math
+import Std.Option as Option
+import Std.Text as Text
+import PuduLangHttpClient.Domain.Date as Date
+
+/** @Domain.Cookie.Stored — one cookie as a jar keeps it */
+export type Stored = {
+  name: Str,
+  value: Str,
+  domain: Str,
+  hostOnly: Bool,
+  path: Str,
+  secure: Bool,
+  httpOnly: Bool,
+  expires: Option[Int],
+  created: Int
+} derives Json.Encode, Json.Decode
+
+/// How much one character of path outweighs creation time when cookies are ordered.
+const PATH_WEIGHT: Int = 1000000000000000
+
+/// The cookie a `set-cookie` value sets for a response from `host` to a request for `path`, at
+/// `now` milliseconds since the Unix epoch; `None` when it is malformed or names a domain the host
+/// does not belong to. `Max-Age` takes precedence over `Expires`.
+export fn parse(header: Str, host: Str, path: Str, now: Int) -> Option[Stored] {
+  let pieces = header.split(";")
+  let pair = pieces[0]
+  let equals = pair.indexOf("=")
+  if equals < 1 { return None }
+  let name = pair.slice(0, equals).trim()
+  if name.isEmpty() { return None }
+  var cookie = Stored {
+    name: name,
+    value: unquoted(pair.drop(equals + 1).trim()),
+    domain: host.toLower(),
+    hostOnly: true,
+    path: defaultPath(path),
+    secure: false,
+    httpOnly: false,
+    expires: None,
+    created: now
+  }
+  var maxAge: Option[Int] = None
+  var expires: Option[Int] = None
+  for piece in pieces.slice(1, pieces.length()) {
+    let (named, given) = Text.breakOn(piece, "=")
+    let key = named.trim().toLower()
+    let value = Text.stripPrefix(given, "=").trim()
+    if key == "domain" && !value.isEmpty() {
+      let domain = Text.stripPrefix(value, ".").toLower()
+      if !domainMatches(host.toLower(), domain) { return None }
+      cookie = Stored{..cookie, domain: domain, hostOnly: false}
+    } else if key == "path" && value.startsWith("/") {
+      cookie = Stored{..cookie, path: value}
+    } else if key == "secure" {
+      cookie = Stored{..cookie, secure: true}
+    } else if key == "httponly" {
+      cookie = Stored{..cookie, httpOnly: true}
+    } else if key == "max-age" {
+      if let Some(seconds) = value.toInt() { maxAge = Some(Math.max(seconds, 0) * 1000) }
+    } else if key == "expires" {
+      expires = Date.parse(value)
+    }
+  }
+  let ending = match maxAge {
+    case Some(millis) => Some(now + millis)
+    case None => expires
+  }
+  Some(Stored{..cookie, expires: ending})
+}
+
+/// Whether a host belongs to a cookie domain: it is the domain, or a name ending in `.` and the
+/// domain when the host is not an IP address.
+export fn domainMatches(host: Str, domain: Str) -> Bool {
+  host == domain || (host.endsWith("." + domain) && !isAddress(host))
+}
+
+/// Whether a request path lies under a cookie path.
+export fn pathMatches(requestPath: Str, cookiePath: Str) -> Bool {
+  requestPath == cookiePath
+    || (requestPath.startsWith(cookiePath) && (cookiePath.endsWith("/") || requestPath.drop(cookiePath.length()).startsWith("/")))
+}
+
+/// Whether a cookie has expired at `now`.
+export fn expired(cookie: &Stored, now: Int) -> Bool {
+  match cookie.expires {
+    case Some(at) => at <= now
+    case None => false
+  }
+}
+
+/// Whether a cookie is sent with a request to `host` for `path` over a connection that is or is not
+/// secured, at `now`.
+export fn applies(cookie: &Stored, host: Str, path: Str, secure: Bool, now: Int) -> Bool {
+  let lower = host.toLower()
+  let hostFits = if cookie.hostOnly { lower == cookie.domain } else { domainMatches(lower, cookie.domain) }
+  hostFits && pathMatches(if path.isEmpty() { "/" } else { path }, cookie.path) && (secure || !cookie.secure) && !expired(cookie, now)
+}
+
+/// The jar with a cookie stored: it replaces the one with the same name, domain, and path, keeping
+/// that one's creation time, and an expired cookie only removes.
+export fn store(jar: &Array[Stored], cookie: &Stored, now: Int) -> Array[Stored] {
+  let previous = jar.filter(|held: Stored| same(&held, cookie))
+  let others = jar.filter(|held: Stored| !same(&held, cookie) && !expired(&held, now))
+  if expired(cookie, now) { return others }
+  let created = match previous {
+    case [first, ..] => first.created
+    case _ => cookie.created
+  }
+  others.push(Stored{..*cookie, created: created})
+}
+
+/// The `cookie` header value of the cookies, longer paths first and older cookies first among equals.
+export fn render(cookies: &Array[Stored]) -> Str {
+  let ordered = cookies.sortBy(|left: Stored, right: Stored| rank(&left) < rank(&right))
+  ordered.map(|cookie: Stored| cookie.name + "=" + cookie.value).join("; ")
+}
+
+/// The path a cookie defaults to: the request path up to its last segment, or `/`.
+export fn defaultPath(path: Str) -> Str {
+  if !path.startsWith("/") { return "/" }
+  let (front, _) = Text.breakOnEnd(path, "/")
+  if front.length() <= 1 { "/" } else { Text.dropEnd(front, 1) }
+}
+
+/// The order a cookie is sent in: longer paths first, then older cookies; a path character outweighs
+/// any creation time in milliseconds.
+fn rank(cookie: &Stored) -> Int { cookie.created - cookie.path.length() * PATH_WEIGHT }
+
+/// Whether two cookies have the same name, domain, and path.
+fn same(left: &Stored, right: &Stored) -> Bool {
+  left.name == right.name && left.domain == right.domain && left.path == right.path
+}
+
+/// Whether a host is an IP address rather than a name.
+fn isAddress(host: Str) -> Bool {
+  host.contains(":") || Text.allChars(host, |c: Char| c == '.' || (c >= '0' && c <= '9'))
+}
+
+/// A value with one pair of surrounding double quotes removed.
+fn unquoted(value: Str) -> Str {
+  if value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"") { value.slice(1, value.length() - 1) } else { value }
+}
+
+/// Whether the cookie lasts beyond the session that received it.
+export fn isPersistent(cookie: &Stored) -> Bool { Option.isSome(&cookie.expires) }

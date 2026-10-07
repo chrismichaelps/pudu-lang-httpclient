@@ -1,0 +1,63 @@
+/** @Domain.Date.Module — HTTP dates read as Unix milliseconds */
+module PuduLangHttpClient.Domain.Date
+
+/// The month each three-letter name stands for.
+const MONTHS: Map[Str, Int] = mapOf([
+    ("jan", 1), ("feb", 2), ("mar", 3), ("apr", 4), ("may", 5), ("jun", 6),
+    ("jul", 7), ("aug", 8), ("sep", 9), ("oct", 10), ("nov", 11), ("dec", 12)
+  ])
+
+/// Milliseconds in one day.
+const DAY_MILLIS: Int = 86400000
+
+/// The instant an HTTP date names, in milliseconds since the Unix epoch, or `None`.
+///
+/// Reads the preferred `Sun, 06 Nov 1994 08:49:37 GMT`, the obsolete `Sunday, 06-Nov-94 08:49:37
+/// GMT`, and the `Sun Nov  6 08:49:37 1994` forms; a two-digit year below 70 is in the 2000s.
+export fn parse(text: Str) -> Option[Int] {
+  var day: Option[Int] = None
+  var month: Option[Int] = None
+  var year: Option[Int] = None
+  var clock: Option[Int] = None
+  for token in tokens(text) {
+    if token.contains(":") {
+      clock = timeOf(token)
+    } else if let Some(found) = MONTHS.get(token.take(3).toLower()) {
+      month = Some(found)
+    } else if let Some(number) = token.toInt() {
+      if token.length() <= 2 && day == None { day = Some(number) } else { year = Some(fullYear(number, token.length())) }
+    }
+  }
+  let (d, m, y, t) = (day ?, month ?, year ?, clock ?)
+  if d < 1 || d > 31 || y < 1601 { return None }
+  Some(daysFromCivil(y, m, d) * DAY_MILLIS + t)
+}
+
+/// The pieces of a date between spaces, commas, and dashes.
+fn tokens(text: Str) -> Array[Str] {
+  text.replace(",", " ").replace("-", " ").split(" ").filter(|piece: Str| !piece.isEmpty())
+}
+
+/// A four-digit year from a written one, reading two digits as 1970 to 2069.
+fn fullYear(number: Int, digits: Int) -> Int {
+  if digits > 2 { number } else if number < 70 { number + 2000 } else { number + 1900 }
+}
+
+/// The milliseconds since midnight an `hh:mm:ss` time names, or `None`.
+fn timeOf(token: Str) -> Option[Int] {
+  let parts = token.split(":")
+  if parts.length() != 3 { return None }
+  let (h, m, s) = (parts[0].toInt() ?, parts[1].toInt() ?, parts[2].toInt() ?)
+  if h > 23 || m > 59 || s > 60 { None } else { Some(((h * 60 + m) * 60 + s) * 1000) }
+}
+
+/// Days from 1970-01-01 to a date in the proleptic Gregorian calendar.
+fn daysFromCivil(year: Int, month: Int, day: Int) -> Int {
+  let shifted = if month <= 2 { year - 1 } else { year }
+  let era = shifted / 400
+  let yearOfEra = shifted - era * 400
+  let monthFromMarch = if month > 2 { month - 3 } else { month + 9 }
+  let dayOfYear = (153 * monthFromMarch + 2) / 5 + day - 1
+  let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+  era * 146097 + dayOfEra - 719468
+}

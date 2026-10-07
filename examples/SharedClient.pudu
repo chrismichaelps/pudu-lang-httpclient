@@ -1,0 +1,59 @@
+/** @Examples.SharedClient.Program — one client configured once and used from several places */
+module SharedClient
+
+import Std.Concurrent as Concurrent
+import Std.Http.Server.Reply as Reply
+import Std.Http.Server.Route as Route
+import Std.Http.Server as Server
+import Std.Io as Io
+import Std.Result as Result
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport as Transport
+
+/** @Examples.SharedClient.Catalog — a part of the program that reads the catalog */
+type Catalog = { http: Client.Client }
+
+/** @Examples.SharedClient.Orders — another part that places orders through the same client */
+type Orders = { http: Client.Client }
+
+/// The catalog's items.
+fn items(catalog: &Catalog) -> HttpClient.Outcome[Str] { Client.getText(&catalog.http, "items") }
+
+/// The status of placing an order.
+fn place(orders: &Orders, sku: Str) -> HttpClient.Outcome[Int] {
+  Result.map(Client.post(&orders.http, "orders", Content.plain(sku)), |response: Response.Response| response.status.code)
+}
+
+/// Starts a local shop and answers its address.
+fn serve() -> (Server.Running, Str) {
+  let running = match Server.start("127.0.0.1", 0) {
+    case Ok(found) => found
+    case Err(problem) => panic(show(problem))
+  }
+  let server = Server.server(&Route.routing(&[
+        Route.get("/items", |_request: Route.Request| Reply.text(200, "tea,cake")),
+        Route.post("/orders", |_request: Route.Request| Reply.text(201, "placed"))
+      ]))
+  let _serving = Concurrent.start(fn() -> () { let _ran = Server.run(&server, &running, 0) })
+  (running, "http://127.0.0.1:" + show(Server.portOf(&running)) + "/")
+}
+
+/// Configures one client at startup, hands it to two parts of the program, and answers 0 when both
+/// were served over one kept-alive connection.
+fn main() -> Int {
+  let (running, base) = serve()
+  let transport = Transport.create(Transport.defaults().withPooledConnectionLifetime(120000).withMaxConnectionsPerServer(16))
+  let http = Client.over(&transport).withBaseAddress(base).withDefaultHeader("user-agent", "shop/1.0").withTimeout(10000)
+  let catalog = Catalog{http: http}
+  let orders = Orders{http: http}
+  let listed = items(&catalog)
+  let placed = place(&orders, "tea")
+  let stats = Transport.statistics(&transport)
+  let _said = Io.writeLine(show(listed) + " " + show(placed) + " over " + show(stats.opened) + " connection")
+  Transport.close(&transport)
+  let _stopped = Server.stop(&running)
+  if listed == Ok("tea,cake") && placed == Ok(201) && stats.opened == 1 { 0 } else { 1 }
+}

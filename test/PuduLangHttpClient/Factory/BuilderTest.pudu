@@ -1,0 +1,58 @@
+/** @Test.Factory.Builder.Suite — how one named client and its pipeline are configured */
+module PuduLangHttpClient.Factory.BuilderTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Stub as Stub
+import PuduLangHttpClient.Transport as Transport
+
+/// An observer whose handlers pass every request on.
+fn quiet() -> Builder.Observer { Builder.Observer{outer: |_seen: Builder.Observation| Handler.passThrough(), inner: |_seen: Builder.Observation| Handler.passThrough()} }
+
+/// The client a builder's actions make from a stub.
+fn applied(builder: &Builder.Builder) -> Client.Client {
+  var client = Client.create(Stub.send(&Stub.create()))
+  for action in builder.clientActions { client = action(client) }
+  client
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let shared = Builder.defaults().withTimeout(5000).withHandler(Handler.passThrough()).observedBy(quiet()).redactingHeaders(&["X-Api-Key"]).withHandlerLifetime(1000)
+  let own = Builder.named("api").withBaseAddress("https://api.test/").withDefaultHeader("accept", "*/*").withMaxResponseContentBufferSize(10).withDefaultVersion(Http.Http10, Version.Exact).withHandlerFactory(|| Handler.passThrough()).withTransport(Transport.defaults()).configureTransport(|options: Transport.Options| options.withDecompression())
+  let combined = Builder.combine(&shared, &own)
+  let cleared = Builder.combine(&shared, &Builder.named("bare").withoutObservers().observedBy(quiet()).withPrimary(|| Stub.send(&Stub.create())).redactingWhen(|name: Str| name.startsWith("x-secret")))
+  let client = applied(&combined)
+  let redact = Builder.redaction(&combined)
+  let custom = Builder.redaction(&cleared)
+  let checks = Test.suite("Factory.Builder", &[
+      Test.equals("a named builder applies to its name only", &(own.name, own.everyClient, Builder.defaults().everyClient), &("api", false, true)),
+      Test.equals("client settings run defaults first, then the name's", &(client.timeout, client.baseAddress, client.defaultHeaders, client.maxResponseContentBufferSize, client.defaultVersion, client.defaultVersionPolicy), &(5000, Some("https://api.test/"), [("accept", "*/*")], 10, Http.Http10, Version.Exact)),
+      Test.equals("handlers and edits are joined in order", &(combined.handlers.length(), combined.transportEdits.length()), &(2, 1)),
+      Test.that("a later primary handler replaces an earlier one", match cleared.primary {
+          case Some(Builder.Custom(_)) => true
+          case _ => false
+        }),
+      Test.that("an earlier primary handler is kept when a later builder names none", match Builder.combine(&own, &Builder.named("api")).primary {
+          case Some(Builder.Pooled(_)) => true
+          case _ => false
+        }),
+      Test.equals("the later lifetime wins and the default applies without one", &(Builder.lifetimeOf(&combined), Builder.lifetimeOf(&Builder.combine(&shared, &Builder.named("x").withHandlerLifetime(Defaults.INFINITE))), Builder.lifetimeOf(&Builder.named("y"))), &(1000, Defaults.INFINITE, Defaults.HANDLER_LIFETIME)),
+      Test.equals("observers are joined unless a later builder clears them", &(combined.observers.length(), cleared.observers.length()), &(1, 1)),
+      Test.that("sensitive and named headers are redacted without regard to case", redact("Authorization") && redact("cookie") && redact("set-cookie") && redact("proxy-authorization") && redact("x-api-key")),
+      Test.not("other headers are not", redact("accept") || custom("x-api")),
+      Test.that("a predicate redacts what it holds for", custom("X-Secret-Token") && custom("x-api-key")),
+      Test.equals("a builder without a predicate has none", &(combined.redactWhen == None, cleared.redactWhen != None), &(true, true))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

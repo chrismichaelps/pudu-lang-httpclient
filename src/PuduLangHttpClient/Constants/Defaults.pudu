@@ -1,0 +1,50 @@
+/** @Constants.Defaults.Module — the numbers every option starts from */
+module PuduLangHttpClient.Constants.Defaults
+
+/// A duration that never elapses: no timeout, no lifetime, no idle limit.
+export const INFINITE: Int = -1
+
+/// A count that never runs out.
+export const UNLIMITED: Int = 9223372036854775807
+
+/// The name of the client a factory makes when no name is given.
+export const DEFAULT_NAME: Str = ""
+
+/// How long a client waits for a whole request, in milliseconds: 100 seconds.
+export const CLIENT_TIMEOUT: Int = 100000
+
+/// The most response body bytes a client buffers: 64 MiB.
+export const MAX_RESPONSE_BUFFER: Int = 67108864
+
+/// How long a factory reuses one handler pipeline before building the next: two minutes.
+export const HANDLER_LIFETIME: Int = 120000
+
+/// How long a pooled connection may sit unused before it is closed: one minute.
+export const POOLED_IDLE_TIMEOUT: Int = 60000
+
+/// How long a pooled connection may live, however busy: forever.
+export const POOLED_LIFETIME: Int = -1
+
+/// How many connections one origin may hold open at once: no limit.
+export const MAX_CONNECTIONS_PER_SERVER: Int = 9223372036854775807
+
+/// How long opening a connection may take: bounded only by the request's own deadline.
+export const CONNECT_TIMEOUT: Int = -1
+
+/// How many redirects the transport follows before it refuses: 50.
+export const MAX_REDIRECTS: Int = 50
+
+/// The most bytes a response head may take: 64 KiB.
+export const MAX_RESPONSE_HEADERS: Int = 65536
+
+/// How many bytes one read asks the socket for.
+export const READ_CHUNK: Int = 65536
+
+/// How long a request waiting for a free connection sleeps before it looks again, in milliseconds.
+export const POOL_WAIT_SLICE: Int = 2
+
+/// The port an http address uses when it names none.
+export const HTTP_PORT: Int = 80
+
+/// The port an https address uses when it names none.
+export const HTTPS_PORT: Int = 443

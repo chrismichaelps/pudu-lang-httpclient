@@ -1,0 +1,197 @@
+/** @HttpClient.Client.Module — a configured client sending requests through its pipeline */
+module PuduLangHttpClient.Client
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Option as Option
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Options as RequestOptions
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport as Transport
+import PuduLangHttpClient.Utils.Shared as Shared
+import PuduLangHttpClient.Utils.Template as Template
+import PuduLangHttpClient.Utils.Tokens as Tokens
+
+/** @HttpClient.Client.Client — a pipeline and the defaults every request through it gets */
+export type Client = {
+  name: Str,
+  send: Handler.Send,
+  baseAddress: Option[Str],
+  defaultHeaders: Array[(Str, Str)],
+  timeout: Int,
+  maxResponseContentBufferSize: Int,
+  defaultVersion: Http.Version,
+  defaultVersionPolicy: Version.Policy,
+  pending: Shared.Shared[Cancel.Token]
+}
+
+/// The reason given to requests cancelled by `cancelPending`.
+const PENDING_CANCELLED: Str = "the client cancelled its pending requests"
+
+/// A client sending through `send`, with no base address or default headers, a 100-second timeout,
+/// and a 64 MiB response buffer.
+export fn create(sender: Handler.Send) -> Client {
+  Client {
+    name: Defaults.DEFAULT_NAME,
+    send: sender,
+    baseAddress: None,
+    defaultHeaders: [],
+    timeout: Defaults.CLIENT_TIMEOUT,
+    maxResponseContentBufferSize: Defaults.MAX_RESPONSE_BUFFER,
+    defaultVersion: Http.Http11,
+    defaultVersionPolicy: Version.OrLower,
+    pending: Shared.shared(Cancel.token())
+  }
+}
+
+/// A client sending straight through a transport.
+export fn over(transport: &Transport.Transport) -> Client { create(Transport.send(transport)) }
+
+/// A long-lived client over a pooled transport of its own, configured once and shared: every copy
+/// of it sends through the same pool. Give the options a pooled connection lifetime so the client
+/// still sees addresses change.
+export fn pooled(options: Transport.Options) -> Client { over(&Transport.create(options)) }
+
+/// Every reason the client's settings cannot be followed.
+export fn validate(client: &Client) -> Array[Str] {
+  var problems: Array[Str] = []
+  if let Some(base) = client.baseAddress {
+    if Option.isNone(&Uri.endpointOf(base)) { problems = problems.push("baseAddress must be an absolute http or https address: " + base) }
+  }
+  if client.timeout < 1 && client.timeout != Defaults.INFINITE { problems = problems.push("timeout must be positive or INFINITE") }
+  if client.maxResponseContentBufferSize < 0 { problems = problems.push("maxResponseContentBufferSize must be at least 0") }
+  if let Some(name) = Headers.unwritable(&client.defaultHeaders) { problems = problems.push(Template.fill(Messages.BAD_HEADER, &[name])) }
+  problems
+}
+
+/** @HttpClient.Client.Configuring — a client changed one decision at a time */
+export trait Configuring {
+  /// The client resolving relative addresses against a base address.
+  fn withBaseAddress(self: &Self, address: Str) -> Self
+  /// The client adding a header to every request that does not carry it.
+  fn withDefaultHeader(self: &Self, name: Str, value: Str) -> Self
+  /// The client giving each request this many milliseconds, or `Defaults.INFINITE`.
+  fn withTimeout(self: &Self, millis: Int) -> Self
+  /// The client buffering at most this many response body bytes.
+  fn withMaxResponseContentBufferSize(self: &Self, bytes: Int) -> Self
+  /// The client sending the requests its helpers build with this version and policy.
+  fn withDefaultVersion(self: &Self, version: Http.Version, policy: Version.Policy) -> Self
+  /// The client known by a name.
+  fn named(self: &Self, name: Str) -> Self
+}
+
+impl Configuring for Client {
+  /// The client resolving relative addresses against a base address.
+  fn withBaseAddress(self: &Self, address: Str) -> Self { Client{..*self, baseAddress: Some(address)} }
+
+  /// The client adding a header to every request that does not carry it.
+  fn withDefaultHeader(self: &Self, name: Str, value: Str) -> Self { Client{..*self, defaultHeaders: Headers.add(&self.defaultHeaders, name, value)} }
+
+  /// The client giving each request this many milliseconds, or `Defaults.INFINITE`.
+  fn withTimeout(self: &Self, millis: Int) -> Self { Client{..*self, timeout: millis} }
+
+  /// The client buffering at most this many response body bytes.
+  fn withMaxResponseContentBufferSize(self: &Self, bytes: Int) -> Self { Client{..*self, maxResponseContentBufferSize: bytes} }
+
+  /// The client sending the requests its helpers build with this version and policy.
+  fn withDefaultVersion(self: &Self, version: Http.Version, policy: Version.Policy) -> Self { Client{..*self, defaultVersion: version, defaultVersionPolicy: policy} }
+
+  /// The client known by a name.
+  fn named(self: &Self, name: Str) -> Self { Client{..*self, name: name} }
+}
+
+/// The response to a request, which may be cancelled only by the client's timeout and `cancelPending`.
+export fn send(client: &Client, request: Request.Request) -> HttpClient.Outcome[Response.Response] {
+  sendWith(client, request, Cancel.token())
+}
+
+/// The response to a request: its address resolved against the base address, the default headers
+/// it lacks added, and its body buffered within the client's limit; cancelled when `token` fires,
+/// the client's timeout passes, or `cancelPending` is called.
+export fn sendWith(client: &Client, request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] {
+  let uri = resolved(client, request.uri) ?
+  let prepared = Request.Request {
+    ..request,
+    uri: uri,
+    headers: Headers.merged(&client.defaultHeaders, &request.headers),
+    options: RequestOptions.set(&request.options, &Transport.bufferLimit(), client.maxResponseContentBufferSize)
+  }
+  let linked = Tokens.linked(&[token, Shared.current(&client.pending)], client.timeout)
+  match (client.send)(prepared, linked) {
+    case Err(HttpClient.TimedOut(elapsed)) => {
+      if client.timeout != Defaults.INFINITE && !Cancel.stopped(&token) { Err(HttpClient.TimedOut(client.timeout)) } else { Err(HttpClient.TimedOut(elapsed)) }
+    }
+    case other => other
+  }
+}
+
+/// Cancels every request in flight and lets later requests run.
+export fn cancelPending(client: &Client) -> () {
+  let previous = Shared.change(&client.pending, |current: Cancel.Token| (Cancel.token(), current))
+  let _cancelled = Cancel.cancel(&previous, PENDING_CANCELLED)
+}
+
+/// A request the client's helpers build: the method and address, with the client's default version.
+export fn build(client: &Client, method: Http.Method, uri: Str) -> Request.Request {
+  Request.Request{..Request.create(method, uri), version: client.defaultVersion, versionPolicy: client.defaultVersionPolicy}
+}
+
+/// The response to a `GET`, whatever its status.
+export fn get(client: &Client, uri: Str) -> HttpClient.Outcome[Response.Response] { send(client, build(client, Http.Get, uri)) }
+
+/// The body of a successful `GET` as UTF-8 text.
+export fn getText(client: &Client, uri: Str) -> HttpClient.Outcome[Str] {
+  let response = Response.ensureSuccess(get(client, uri) ?) ?
+  Response.text(&response)
+}
+
+/// The body of a successful `GET` as bytes.
+export fn getBytes(client: &Client, uri: Str) -> HttpClient.Outcome[Bytes] {
+  let response = Response.ensureSuccess(get(client, uri) ?) ?
+  Ok(Response.bytes(&response))
+}
+
+/// The head of a successful `GET` whose body was handed to `receiver` as it arrived instead of being
+/// buffered; `receiver` answers `false` to stop reading.
+export fn stream(client: &Client, uri: Str, receiver: Request.Receiver) -> HttpClient.Outcome[Response.Response] {
+  Response.ensureSuccess(send(client, Request.Request{..build(client, Http.Get, uri), receiver: Some(receiver)}) ?)
+}
+
+/// The response to a `HEAD`, whatever its status.
+export fn head(client: &Client, uri: Str) -> HttpClient.Outcome[Response.Response] { send(client, build(client, Http.Head, uri)) }
+
+/// The response to a `POST` carrying a body, whatever its status.
+export fn post(client: &Client, uri: Str, content: Content.Content) -> HttpClient.Outcome[Response.Response] {
+  send(client, Request.Request{..build(client, Http.Post, uri), content: Some(content)})
+}
+
+/// The response to a `PUT` carrying a body, whatever its status.
+export fn put(client: &Client, uri: Str, content: Content.Content) -> HttpClient.Outcome[Response.Response] {
+  send(client, Request.Request{..build(client, Http.Put, uri), content: Some(content)})
+}
+
+/// The response to a `PATCH` carrying a body, whatever its status.
+export fn patch(client: &Client, uri: Str, content: Content.Content) -> HttpClient.Outcome[Response.Response] {
+  send(client, Request.Request{..build(client, Http.Patch, uri), content: Some(content)})
+}
+
+/// The response to a `DELETE`, whatever its status.
+export fn delete(client: &Client, uri: Str) -> HttpClient.Outcome[Response.Response] { send(client, build(client, Http.Delete, uri)) }
+
+/// The address a request goes to: absolute as given, or resolved against the base address.
+fn resolved(client: &Client, uri: Str) -> HttpClient.Outcome[Str] {
+  let escaped = Uri.escape(uri)
+  if Uri.isAbsolute(escaped) { return Ok(escaped) }
+  match client.baseAddress {
+    case Some(base) => Ok(Uri.resolve(base, escaped))
+    case None => HttpClient.invalid(Template.fill(Messages.RELATIVE_WITHOUT_BASE, &[uri]))
+  }
+}

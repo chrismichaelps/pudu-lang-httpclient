@@ -1,0 +1,195 @@
+/** @HttpClient.Factory.Module — named clients over handler pipelines the factory owns and renews */
+module PuduLangHttpClient.Factory
+
+import Std.Concurrent.Cancel as Cancel
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Domain.Expiry as Expiry
+import PuduLangHttpClient.Events.Bus as Bus
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory.Entry as Entry
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport.Pool as Pool
+import PuduLangHttpClient.Transport as Transport
+import PuduLangHttpClient.Utils.Shared as Shared
+import PuduLangHttpClient.Utils.Template as Template
+
+/** @HttpClient.Factory.Options — who hears about the factory's requests and pipelines */
+export type Options = { listeners: Events.Listeners }
+
+/** @HttpClient.Factory.Invalid — every reason a factory could not be built */
+export type Invalid = { problems: Array[Str] }
+
+/** @HttpClient.Factory.State — the live pipeline of each name, the expired ones, and a counter */
+type State = { active: Map[Str, Entry.Entry], expired: Array[Entry.Entry], generation: Int }
+
+/** @HttpClient.Factory.Factory — the merged configuration of every name and the pipelines built */
+export type Factory = { builders: Map[Str, Builder.Builder], defaults: Builder.Builder, state: Shared.Shared[State], bus: Bus.Bus }
+
+/// No listeners.
+export fn defaults() -> Options { Options{listeners: Events.listeners()} }
+
+/// A factory configured by the builders; builders of the same name are combined in order, and the
+/// defaults' builders apply to every name first. Every problem with any name is reported at once.
+export fn build(builders: Array[Builder.Builder]) -> Result[Factory, Invalid] { buildWith(&defaults(), builders) }
+
+/// A factory configured by the builders, telling the options' listeners about every request through
+/// its clients and every pipeline it creates, expires, and closes.
+export fn buildWith(options: &Options, builders: Array[Builder.Builder]) -> Result[Factory, Invalid] {
+  var shared = Builder.defaults()
+  var named: Map[Str, Builder.Builder] = mapOf([])
+  for builder in builders {
+    if builder.everyClient {
+      shared = Builder.combine(&shared, &builder)
+    } else {
+      named = named.insert(builder.name, match named.get(builder.name) {
+          case Some(earlier) => Builder.combine(&earlier, &builder)
+          case None => builder
+        })
+    }
+  }
+  var merged: Map[Str, Builder.Builder] = mapOf([])
+  for (name, builder) in named.entries() { merged = merged.insert(name, Builder.combine(&shared, &builder)) }
+  var problems: Array[Str] = []
+  for builder in merged.values().push(shared) { problems = problems.concat(problemsOf(&builder)) }
+  if !problems.isEmpty() { return Err(Invalid{problems: problems}) }
+  Ok(Factory{builders: merged, defaults: shared, state: Shared.shared(State{active: mapOf([]), expired: [], generation: 0}), bus: Bus.create(&options.listeners)})
+}
+
+/// The sentence describing every problem.
+export fn explain(invalid: &Invalid) -> Str { Template.fill(Messages.FACTORY_INVALID, &[invalid.problems.join(Messages.PROBLEM_SEPARATOR)]) }
+
+/// A client of the given name over that name's current pipeline; a name never configured gets the
+/// defaults. Clients are cheap: make one where it is needed rather than keeping it.
+export fn createClient(factory: &Factory, name: Str) -> Client.Client {
+  let builder = builderOf(factory, name)
+  var made = Client.create(createHandler(factory, name)).named(name)
+  for action in builder.clientActions { made = action(made) }
+  made
+}
+
+/// The client with the default name.
+export fn client(factory: &Factory) -> Client.Client { createClient(factory, Defaults.DEFAULT_NAME) }
+
+/// A typed client: whatever `make` builds around a client of the given name.
+export fn typed[T](factory: &Factory, name: Str, make: fn(Client.Client) -> T) -> T { make(createClient(factory, name)) }
+
+/// The current handler pipeline of a name, built when the name has none or its lifetime ran out.
+export fn createHandler(factory: &Factory, name: Str) -> Handler.Send {
+  let entry = liveEntry(factory, name)
+  entry.send
+}
+
+/// Every name configured on its own.
+export fn names(factory: &Factory) -> Array[Str] { factory.builders.keys() }
+
+/// The connection counters of a name's current pipeline, when its primary handler is a transport.
+export fn statistics(factory: &Factory, name: Str) -> Option[Pool.Statistics] {
+  let entry = Shared.current(&factory.state).active.get(name) ?
+  let transport = entry.transport ?
+  Some(Transport.statistics(&transport))
+}
+
+/// How many expired pipelines are still waiting to be closed.
+export fn pendingExpired(factory: &Factory) -> Int { Shared.current(&factory.state).expired.length() }
+
+/// Closes every pipeline's transport, live or expired; clients made earlier keep working and open
+/// connections they close afterwards.
+export fn dispose(factory: &Factory) -> () {
+  let entries = Shared.change(&factory.state, |state: State| (State{..state, active: mapOf([]), expired: []}, state.active.values().concat(state.expired)))
+  for entry in entries { closeEntry(factory, &entry) }
+}
+
+/// A sender that asks the factory for the name's current pipeline on every request, so code holding
+/// it for a long time still moves to each new pipeline.
+export fn rotatingHandler(factory: &Factory, name: Str) -> Handler.Send {
+  let held = *factory
+  fn(request: Request.Request, token: Cancel.Token) -> HttpClient.Outcome[Response.Response] { createHandler(&held, name)(request, token) }
+}
+
+/// The merged configuration of a name.
+fn builderOf(factory: &Factory, name: Str) -> Builder.Builder {
+  match factory.builders.get(name) {
+    case Some(found) => found
+    case None => Builder.Builder{..factory.defaults, name: name, everyClient: false}
+  }
+}
+
+/// The live pipeline of a name; a new one replaces it once its lifetime ran out, and expired
+/// pipelines whose grace has passed are closed.
+fn liveEntry(factory: &Factory, name: Str) -> Entry.Entry {
+  let now = clock()
+  let live = Shared.current(&factory.state).active.get(name)
+  if let Some(entry) = live {
+    if !Expiry.elapsed(entry.created, entry.lifetime, now) { return entry }
+  }
+  let builder = builderOf(factory, name)
+  let generation = Shared.change(&factory.state, |state: State| (State{..state, generation: state.generation + 1}, state.generation + 1))
+  let fresh = Entry.build(&withBus(factory, &builder), generation)
+  let (chosen, retired, closing) = Shared.change(&factory.state, |state: State| install(&state, &fresh, now))
+  if chosen.generation != fresh.generation { Entry.close(&fresh) } else { Bus.pipelineChanged(&factory.bus, name, fresh.generation, Events.Created) }
+  for entry in retired { Bus.pipelineChanged(&factory.bus, entry.name, entry.generation, Events.Expired) }
+  for entry in closing { closeEntry(factory, &entry) }
+  chosen
+}
+
+/// The state with a freshly built pipeline installed unless another thread installed a live one
+/// first; answers the pipeline to use, the one it replaced, and the expired ones to close now.
+fn install(state: &State, fresh: &Entry.Entry, now: Int) -> (State, (Entry.Entry, Array[Entry.Entry], Array[Entry.Entry])) {
+  let (keep, closing) = (state.expired.filter(|entry: Entry.Entry| !graceOver(&entry, now)), state.expired.filter(|entry: Entry.Entry| graceOver(&entry, now)))
+  match state.active.get(fresh.name) {
+    case Some(entry) => {
+      if !Expiry.elapsed(entry.created, entry.lifetime, now) {
+        (State{..*state, expired: keep}, (entry, [], closing))
+      } else {
+        let retired = Entry.Entry{..entry, expiredAt: Some(now)}
+        (State{..*state, active: state.active.insert(fresh.name, *fresh), expired: keep.push(retired)}, (*fresh, [retired], closing))
+      }
+    }
+    case None => (State{..*state, active: state.active.insert(fresh.name, *fresh), expired: keep}, (*fresh, [], closing))
+  }
+}
+
+/// Whether an expired pipeline has outlived one more lifetime, after which clients made from it
+/// are assumed gone.
+fn graceOver(entry: &Entry.Entry, now: Int) -> Bool {
+  match entry.expiredAt {
+    case Some(at) => Expiry.elapsed(at, entry.lifetime, now)
+    case None => false
+  }
+}
+
+/// Closes a pipeline's transport and says so.
+fn closeEntry(factory: &Factory, entry: &Entry.Entry) -> () {
+  Entry.close(entry)
+  Bus.pipelineChanged(&factory.bus, entry.name, entry.generation, Events.Closed)
+}
+
+/// The builder with the bus's observer outermost, when anyone listens to requests.
+fn withBus(factory: &Factory, builder: &Builder.Builder) -> Builder.Builder {
+  match Bus.observer(&factory.bus) {
+    case Some(observer) => Builder.Builder{..*builder, observers: [observer].concat(builder.observers)}
+    case None => *builder
+  }
+}
+
+/// Every reason a name's merged configuration cannot be followed.
+fn problemsOf(builder: &Builder.Builder) -> Array[Str] {
+  var probe = Client.create(|request: Request.Request, _token: Cancel.Token| Ok(Response.answer(&request, 200)))
+  for action in builder.clientActions { probe = action(probe) }
+  var problems = Client.validate(&probe)
+  let lifetime = Builder.lifetimeOf(builder)
+  if lifetime < 0 && lifetime != Defaults.INFINITE { problems = problems.push("handlerLifetime must be at least 0 ms or INFINITE") }
+  match builder.primary {
+    case Some(Builder.Custom(_)) => {}
+    case Some(Builder.Pooled(options)) => { problems = problems.concat(Transport.validate(&Entry.transportOptions(builder, options))) }
+    case None => { problems = problems.concat(Transport.validate(&Entry.transportOptions(builder, Transport.defaults()))) }
+  }
+  let name = if builder.everyClient { "(defaults)" } else { builder.name }
+  problems.map(|problem: Str| Template.fill(Messages.CLIENT_PROBLEM, &[name, problem]))
+}

@@ -1,0 +1,38 @@
+/** @Test.Response.Suite — responses read, checked, and built for stubs */
+module PuduLangHttpClient.ResponseTest
+
+import Std.Io as Io
+import Std.Json as Json
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+
+/** @Test.Response.Price — a body read through a derived decoder */
+type Price = { amount: Int } derives Json.Decode
+
+/// Runs the suite.
+fn main() -> Int {
+  let request = Request.get("http://a/")
+  let ok = Response.answer(&request, 200).withHeader("Retry-After", "3").withHeader("content-language", "en").withJson(&Json.object(&[("amount", Json.Number(5))]))
+  let missing = Response.answer(&request, 404)
+  let checks = Test.suite("Response", &[
+      Test.equals("an answer has the status and its reason", &(ok.status.code, missing.status.reason, ok.request.uri), &(200, "Not Found", "http://a/")),
+      Test.that("only a 2xx is a success", Response.isSuccess(&ok) && !Response.isSuccess(&missing) && !Response.isSuccess(&Response.answer(&request, 199)) && !Response.isSuccess(&Response.answer(&request, 300))),
+      Test.equals("a success passes and a failure names its status", &(Result.map(Response.ensureSuccess(ok), |r: Response.Response| r.status.code), Result.map(Response.ensureSuccess(missing), |r: Response.Response| r.status.code)), &(Ok(200), Err(HttpClient.Unsuccessful(404, "Not Found")))),
+      Test.equals("a content header goes with the body and others with the response", &(ok.headers, ok.content.headers), &([("Retry-After", "3")], [("content-type", "application/json; charset=utf-8")])),
+      Test.equals("headers are found among the response's own and then its body's", &(Response.header(&ok, "retry-after"), Response.header(&ok, "Content-Type"), Response.header(&ok, "none")), &(Some("3"), Some("application/json; charset=utf-8"), None)),
+      Test.equals("every value of a header is listed", &Response.headerValues(&missing.withHeader("vary", "a").withHeader("Vary", "b"), "vary"), &["a", "b"]),
+      Test.equals("the body reads as text, bytes, JSON, and a derived value", &(Response.text(&ok), Response.bytes(&ok).length(), Response.json(&ok), Response.readAs[Price](&ok)), &(Ok("\{\"amount\":5\}"), 12, Ok(Json.object(&[("amount", Json.Number(5))])), Ok(Price{amount: 5}))),
+      Test.equals("retry-after is read in milliseconds", &(Response.retryAfter(&ok, 0), Response.retryAfter(&missing, 0)), &(Some(3000), None)),
+      Test.equals("text replaces the body", &Response.text(&missing.withText("gone")), &Ok("gone")),
+      Test.equals("content is set as given", &missing.withContent(Content.octets(&"x".toBytes())).content, &Content.octets(&"x".toBytes()))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

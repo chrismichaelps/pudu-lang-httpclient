@@ -1,0 +1,33 @@
+/** @Domain.Persistence.Module — which connections stay open and which pooled ones are reused */
+module PuduLangHttpClient.Domain.Persistence
+
+import Std.Http.Message as Message
+import PuduLangHttpClient.Domain.Expiry as Expiry
+import PuduLangHttpClient.Domain.Headers as Headers
+
+/** @Domain.Persistence.Idle — one pooled connection waiting for its next request */
+export type Idle[C] = { link: C, created: Int, lastUsed: Int }
+
+/** @Domain.Persistence.Limits — how long a pooled connection may live and sit unused */
+export type Limits = { lifetime: Int, idleTimeout: Int }
+
+/// Whether the connection may carry another request after this exchange: neither side asked to
+/// close it, the body was framed by a length or chunks rather than by closing, and an HTTP/1.0
+/// response asked to keep it alive.
+export fn keepsAlive(version: Str, requestHeaders: &Array[(Str, Str)], responseHeaders: &Array[(Str, Str)], framing: &Message.Framing) -> Bool {
+  let asked = Headers.values(requestHeaders, "connection").concat(Headers.values(responseHeaders, "connection"))
+  let closing = asked.filter(|value: Str| Headers.lists(value, "close")).length() > 0
+  let legacy = version == "HTTP/1.0"
+  let kept = asked.filter(|value: Str| Headers.lists(value, "keep-alive")).length() > 0
+  !closing && *framing != Message.UntilClose && (!legacy || kept)
+}
+
+/// Whether a pooled connection may still be reused at `now`.
+export fn usable[C](idle: &Idle[C], limits: &Limits, now: Int) -> Bool {
+  !Expiry.elapsed(idle.created, limits.lifetime, now) && !Expiry.elapsed(idle.lastUsed, limits.idleTimeout, now)
+}
+
+/// The pooled connections split into those still usable at `now` and those to close.
+export fn sweep[C](idle: &Array[Idle[C]], limits: &Limits, now: Int) -> (Array[Idle[C]], Array[Idle[C]]) {
+  (idle.filter(|one: Idle[C]| usable(&one, limits, now)), idle.filter(|one: Idle[C]| !usable(&one, limits, now)))
+}

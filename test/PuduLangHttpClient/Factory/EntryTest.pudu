@@ -1,0 +1,53 @@
+/** @Test.Factory.Entry.Suite — one built pipeline and the order of its layers */
+module PuduLangHttpClient.Factory.EntryTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import Std.Io as Io
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Factory.Entry as Entry
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+import PuduLangHttpClient.Transport as Transport
+
+/// A handler adding its name to the `trace` header.
+fn tracing(name: Str) -> Handler.Handler { Handler.before(|request: Request.Request| request.withHeader("trace", name)) }
+
+/// An observer tracing its own name outside and inside the other handlers, and the client's name.
+fn observer(name: Str) -> Builder.Observer {
+  Builder.Observer{outer: |seen: Builder.Observation| tracing(name + "-outer-" + seen.name), inner: |_seen: Builder.Observation| tracing(name + "-inner")}
+}
+
+/// The redirect limit of an entry's transport, when it has one.
+fn redirectsOf(entry: &Entry.Entry) -> Option[Int] {
+  let transport = entry.transport ?
+  Some(transport.options.maxAutomaticRedirections)
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.on(&stub, Http.Get, "/", |request: Request.Request| Ok(Response.answer(&request, 200).withText(request.headers.map(|pair: (Str, Str)| pair[1]).join(">"))))
+  let builder = Builder.named("api").observedBy(observer("a")).observedBy(observer("b")).withHandler(tracing("h1")).withHandler(tracing("h2")).withPrimary(|| Stub.send(&stub))
+  let entry = Entry.build(&builder, 7)
+  let order = Result.map(entry.send(Request.get("http://x/"), Cancel.token()), |r: Response.Response| Result.unwrapOr(Response.text(&r), ""))
+  let pooled = Entry.build(&Builder.named("p").configureTransport(|options: Transport.Options| options.withMaxRedirects(2)), 1)
+  let checks = Test.suite("Factory.Entry", &[
+      Test.equals("observers wrap the handlers, the first outermost, and their inner handlers sit innermost in reverse", &order, &Ok("a-outer-api>b-outer-api>h1>h2>b-inner>a-inner")),
+      Test.equals("an entry records its name, generation, and lifetime", &(entry.name, entry.generation, entry.lifetime, entry.expiredAt), &("api", 7, 120000, None)),
+      Test.equals("a program's own primary handler has no transport", &(entry.transport == None), &true),
+      Test.equals("a pooled entry builds its transport from the edited defaults", &redirectsOf(&pooled), &Some(2)),
+      Test.equals("the layers number the observers twice and the handlers once", &Entry.layers(&builder).length(), &6),
+      Test.equals("transport edits run in order", &Entry.transportOptions(&Builder.named("t").configureTransport(|o: Transport.Options| o.withMaxRedirects(3)).configureTransport(|o: Transport.Options| o.withoutRedirects()), Transport.defaults()).allowAutoRedirect, &false)
+    ])
+  Entry.close(&pooled)
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

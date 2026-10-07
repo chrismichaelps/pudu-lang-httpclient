@@ -1,0 +1,89 @@
+/** @Events.Bus.Module — events published to their listeners through a mediator the package owns */
+module PuduLangHttpClient.Events.Bus
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Http as Http
+import PuduLangHttpClient.Events as Events
+import PuduLangHttpClient.Factory.Builder as Builder
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangMediator.Context as Context
+import PuduLangMediator.Mediator as Mediator
+import PuduLangMediator as Messaging
+import PuduLangMediator.Notification as Notification
+import PuduLangMediator.Registration as Registration
+
+/** @Events.Bus.Kinds — the notification kind of each event, made once per bus */
+type Kinds = {
+  started: Notification.Kind[Events.RequestStarted, Str],
+  completed: Notification.Kind[Events.RequestCompleted, Str],
+  failed: Notification.Kind[Events.RequestFailed, Str],
+  changed: Notification.Kind[Events.PipelineChanged, Str]
+}
+
+/** @Events.Bus.Bus — the mediator carrying events, its kinds, and whether anyone hears requests */
+export type Bus = { mediator: Mediator.Mediator, kinds: Kinds, hearsRequests: Bool }
+
+/// A bus delivering each event to its listeners in the order they were added.
+export fn create(given: &Events.Listeners) -> Bus {
+  let kinds = Kinds {
+    started: Notification.kind("httpclient.request.started"),
+    completed: Notification.kind("httpclient.request.completed"),
+    failed: Notification.kind("httpclient.request.failed"),
+    changed: Notification.kind("httpclient.pipeline.changed")
+  }
+  let registrations = registered(&kinds.started, &given.started).concat(registered(&kinds.completed, &given.completed)).concat(registered(&kinds.failed, &given.failed)).concat(registered(&kinds.changed, &given.changed))
+  let mediator = match Mediator.build(registrations) {
+    case Ok(built) => built
+    case Err(invalid) => panic(Mediator.explain(&invalid))
+  }
+  Bus{mediator: mediator, kinds: kinds, hearsRequests: Events.hearsRequests(given)}
+}
+
+/// Publishes a pipeline change.
+export fn pipelineChanged(bus: &Bus, client: Str, generation: Int, stage: Events.Stage) -> () {
+  let _published = Mediator.publish(&bus.mediator, &bus.kinds.changed, Events.PipelineChanged{client: client, generation: generation, stage: stage})
+}
+
+/// The observer announcing every request through a pipeline, when anyone listens to requests.
+export fn observer(bus: &Bus) -> Option[Builder.Observer] {
+  if !bus.hearsRequests { return None }
+  let held = *bus
+  Some(Builder.Observer{outer: |seen: Builder.Observation| announcing(held, seen.name), inner: |_seen: Builder.Observation| Handler.passThrough()})
+}
+
+/// One registration per listener of a kind, named by position so each stays distinct.
+fn registered[N](kind: &Notification.Kind[N, Str], listeners: &Array[fn(N) -> ()]) -> Array[Registration.Registration] {
+  var made: Array[Registration.Registration] = []
+  var index = 0
+  for listen in *listeners {
+    index = index + 1
+    made = made.push(Registration.notificationHandler(kind, "listener-" + show(index), fn(event: N, _context: Context.Context) -> Messaging.Outcome[(), Str] {
+          listen(event)
+          Ok(())
+        }))
+  }
+  made
+}
+
+/// The handler publishing a request's start and end.
+fn announcing(bus: Bus, client: Str) -> Handler.Handler {
+  fn(request: Request.Request, token: Cancel.Token, next: Handler.Send) -> HttpClient.Outcome[Response.Response] {
+    let method = Http.methodName(&request.method)
+    let _started = Mediator.publish(&bus.mediator, &bus.kinds.started, Events.RequestStarted{client: client, method: method, uri: request.uri})
+    let began = clock()
+    let outcome = next(request, token)
+    let elapsed = clock() - began
+    match outcome {
+      case Ok(response) => {
+        let _completed = Mediator.publish(&bus.mediator, &bus.kinds.completed, Events.RequestCompleted{client: client, method: method, uri: request.uri, status: response.status.code, elapsed: elapsed})
+      }
+      case Err(failure) => {
+        let _failed = Mediator.publish(&bus.mediator, &bus.kinds.failed, Events.RequestFailed{client: client, method: method, uri: request.uri, failure: HttpClient.describe(&failure), elapsed: elapsed})
+      }
+    }
+    outcome
+  }
+}

@@ -1,0 +1,32 @@
+/** @Test.Domain.Headers.Suite — header lists compared without regard to case */
+module PuduLangHttpClient.Domain.HeadersTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Domain.Headers as Headers
+
+/// Runs the suite.
+fn main() -> Int {
+  let headers = [("Accept", "text/plain"), ("X-Id", "1"), ("accept", "text/html")]
+  let checks = Test.suite("Domain.Headers", &[
+      Test.equals("the first value is found without regard to case", &(Headers.get(&headers, "ACCEPT"), Headers.get(&headers, "x-id"), Headers.get(&headers, "missing")), &(Some("text/plain"), Some("1"), None)),
+      Test.equals("every value is found in order", &Headers.values(&headers, "accept"), &["text/plain", "text/html"]),
+      Test.that("presence ignores case", Headers.has(&headers, "x-ID") && !Headers.has(&headers, "x-other")),
+      Test.equals("adding keeps earlier values", &Headers.add(&[("a", "1")], "A", "2"), &[("a", "1"), ("A", "2")]),
+      Test.equals("setting replaces every value", &Headers.set(&headers, "accept", "*/*"), &[("X-Id", "1"), ("accept", "*/*")]),
+      Test.equals("removing drops every value", &Headers.remove(&headers, "Accept"), &[("X-Id", "1")]),
+      Test.equals("removing a set of names drops each", &Headers.removeAll(&headers, &#{"accept", "x-id"}), &[]),
+      Test.equals("defaults fill only the names a message lacks, before its own", &Headers.merged(&[("user-agent", "pudu"), ("Accept", "*/*")], &[("accept", "text/plain")]), &[("user-agent", "pudu"), ("accept", "text/plain")]),
+      Test.equals("redacted values are hidden and names kept", &Headers.redacted(&[("Authorization", "Bearer x"), ("accept", "a")], |name: Str| name == "authorization"), &[("Authorization", Headers.REDACTED), ("accept", "a")]),
+      Test.that("content headers are recognised without regard to case", Headers.isContentHeader("Content-Type") && Headers.isContentHeader("expires") && !Headers.isContentHeader("accept")),
+      Test.equals("headers split into the message's and the body's", &Headers.splitContent(&[("date", "d"), ("Content-Length", "3")]), &([("date", "d")], [("Content-Length", "3")])),
+      Test.equals("a header with a line break, a colon in its name, or no name is unwritable", &[Headers.unwritable(&[("a", "b\r\nc: d")]), Headers.unwritable(&[("a:b", "c")]), Headers.unwritable(&[("", "c")]), Headers.unwritable(&[("ok", "fine")])], &[Some("a"), Some("a:b"), Some(""), None]),
+      Test.that("a listed token is found in a comma-separated value", Headers.lists("keep-alive, Close", "close") && Headers.lists("gzip", "GZIP")),
+      Test.not("a token is not found inside another", Headers.lists("closed, x", "close"))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

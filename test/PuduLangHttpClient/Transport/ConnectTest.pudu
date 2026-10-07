@@ -1,0 +1,69 @@
+/** @Test.Transport.Connect.Suite — routes chosen and connections opened through a proxy */
+module PuduLangHttpClient.Transport.ConnectTest
+
+import Std.Concurrent.Cancel as Cancel
+import Std.Io as Io
+import Std.Net as Net
+import Std.Result as Result
+import Std.Sync as Sync
+import Std.Test as Test
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Proxy as Proxy
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Transport.Connect as Connect
+import PuduLangHttpClient.Transport as Transport
+import Support.Loopback as Loopback
+
+/// The endpoint of an address known to be one.
+fn endpoint(uri: Str) -> Uri.Endpoint {
+  match Uri.endpointOf(uri) {
+    case Some(found) => found
+    case None => panic("no endpoint: " + uri)
+  }
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let seen = Sync.cell([])
+  let proxyServer = Loopback.scripted(fn(connection: Net.Connection, _number: Int) -> () {
+      var going = true
+      while going {
+        let request = Loopback.readRequest(&connection)
+        if request.isEmpty() {
+          going = false
+        } else {
+          let _kept = Sync.set(&seen, Result.unwrapOr(Sync.get(&seen), []).push(request))
+          if request.startsWith("CONNECT ") { Loopback.write(&connection, "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n") } else { Loopback.write(&connection, "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nproxied") }
+        }
+      }
+    })
+  let proxy = Proxy.at(proxyServer.base).withCredentials("user", "secret").bypassing(&["*.internal.test", "direct.test"])
+  let through = Transport.create(Transport.defaults().withProxy(proxy))
+  let plain = Transport.send(&through)(Request.get("http://catalog.test/items?page=2"), Cancel.expiring(2000))
+  let secured = Transport.send(&through)(Request.get("https://secure.test/"), Cancel.expiring(2000))
+  let requests = Result.unwrapOr(Sync.get(&seen), [])
+  Loopback.close(&proxyServer)
+  let direct = Connect.routeTo(&endpoint("http://a.internal.test/"), &Some(proxy))
+  let checks = Test.suite("Transport.Connect", &[
+      Test.equals("a plain request through a proxy answers the proxy's response", &Result.map(plain, |r: Response.Response| Result.unwrapOr(Response.text(&r), "")), &Ok("proxied")),
+      Test.that("a plain request names its absolute target", requests.length() > 0 && requests[0].startsWith("GET http://catalog.test/items?page=2 HTTP/1.1\r\n")),
+      Test.that("a plain request carries the proxy's credentials", requests.length() > 0 && requests[0].contains("proxy-authorization: Basic dXNlcjpzZWNyZXQ=")),
+      Test.that("a secured request asks the proxy for a tunnel with credentials", requests.length() > 1 && requests[1].startsWith("CONNECT secure.test:443 HTTP/1.1\r\n") && requests[1].contains("proxy-authorization: Basic")),
+      Test.equals("a refused tunnel is a tunnel failure", &Result.map(secured, |r: Response.Response| r.status.code), &Err(HttpClient.ProxyTunnel("status 403"))),
+      Test.equals("a listed suffix goes direct", &(direct.via == None, direct.key), &(true, "direct http://a.internal.test")),
+      Test.equals("a secured target goes through a tunnel keyed by its origin", &Connect.routeTo(&endpoint("https://s.test/"), &Some(Proxy.at("http://p:3128"))).key, &"tunnel http://p:3128 https://s.test"),
+      Test.equals("a plain target shares the proxy's connections", &Connect.routeTo(&endpoint("http://s.test/"), &Some(Proxy.at("http://p:3128"))).key, &"proxy http://p:3128"),
+      Test.that("only a plain target through a proxy is written in absolute form", Connect.isProxied(&Connect.routeTo(&endpoint("http://s.test/"), &Some(Proxy.at("http://p")))) && !Connect.isProxied(&Connect.routeTo(&endpoint("https://s.test/"), &Some(Proxy.at("http://p")))) && !Connect.isProxied(&Connect.routeTo(&endpoint("http://s.test/"), &None))),
+      Test.that("local hosts bypass when asked", Proxy.bypasses(&Proxy.at("http://p").bypassingLocal(), "localhost") && Proxy.bypasses(&Proxy.at("http://p").bypassingLocal(), "127.0.0.2") && Proxy.bypasses(&Proxy.at("http://p").bypassingLocal(), "intranet")),
+      Test.not("other hosts do not bypass", Proxy.bypasses(&Proxy.at("http://p").bypassingLocal(), "example.com") || Proxy.bypasses(&Proxy.at("http://p"), "localhost")),
+      Test.equals("a proxy must be a plain http address", &[Proxy.validate(&Proxy.at("https://p")).length(), Proxy.validate(&Proxy.at("p:80")).length(), Proxy.validate(&Proxy.at("http://p:3128")).length()], &[1, 1, 0]),
+      Test.equals("a proxy without credentials sends none", &Proxy.authorization(&Proxy.at("http://p")), &None)
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

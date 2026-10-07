@@ -1,0 +1,31 @@
+/** @Test.Domain.Persistence.Suite — which connections stay open and which pooled ones are reused */
+module PuduLangHttpClient.Domain.PersistenceTest
+
+import Std.Http.Message as Message
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Domain.Persistence as Persistence
+
+/// Runs the suite.
+fn main() -> Int {
+  let limits = Persistence.Limits{lifetime: 100, idleTimeout: 10}
+  let idle = Persistence.Idle{link: "a", created: 0, lastUsed: 50}
+  let checks = Test.suite("Domain.Persistence", &[
+      Test.that("an HTTP/1.1 exchange framed by length or chunks keeps its connection", Persistence.keepsAlive("HTTP/1.1", &[], &[], &Message.Length(3)) && Persistence.keepsAlive("HTTP/1.1", &[], &[], &Message.Chunked) && Persistence.keepsAlive("HTTP/1.1", &[], &[], &Message.HeadOnly)),
+      Test.not("a body ending with the connection does not", Persistence.keepsAlive("HTTP/1.1", &[], &[], &Message.UntilClose)),
+      Test.not("either side asking to close does not", Persistence.keepsAlive("HTTP/1.1", &[("Connection", "close")], &[], &Message.Length(0)) || Persistence.keepsAlive("HTTP/1.1", &[], &[("connection", "upgrade, Close")], &Message.Length(0))),
+      Test.not("an HTTP/1.0 response that does not ask to stay does not", Persistence.keepsAlive("HTTP/1.0", &[], &[], &Message.Length(0))),
+      Test.that("an HTTP/1.0 response asking to stay does", Persistence.keepsAlive("HTTP/1.0", &[], &[("connection", "Keep-Alive")], &Message.Length(0))),
+      Test.that("a connection inside both limits is usable", Persistence.usable(&idle, &limits, 59)),
+      Test.not("a connection idle for its timeout is not", Persistence.usable(&idle, &limits, 60)),
+      Test.not("a connection at the end of its lifetime is not", Persistence.usable(&Persistence.Idle{..idle, lastUsed: 95}, &limits, 100)),
+      Test.that("infinite limits keep a connection usable", Persistence.usable(&idle, &Persistence.Limits{lifetime: Defaults.INFINITE, idleTimeout: Defaults.INFINITE}, Defaults.UNLIMITED)),
+      Test.equals("a sweep splits the usable from the expired", &Persistence.sweep(&[idle, Persistence.Idle{..idle, link: "b", lastUsed: 55}], &limits, 62), &([Persistence.Idle{..idle, link: "b", lastUsed: 55}], [idle]))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

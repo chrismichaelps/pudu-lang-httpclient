@@ -1,0 +1,235 @@
+/** @Transport.Exchange.Module — one request written and one response read over a connection */
+module PuduLangHttpClient.Transport.Exchange
+
+import Std.Bytes as ByteSeq
+import Std.Http as Http
+import Std.Http.Message as Message
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient.Domain.Chunked as Chunked
+import PuduLangHttpClient.Domain.Persistence as Persistence
+import PuduLangHttpClient.Domain.Redirect as Redirect
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Transport.Wire as Wire
+import PuduLangHttpClient.Utils.Template as Template
+
+/** @Transport.Exchange.Reading — how much of a response is read before it is refused */
+export type Reading = { headersLimit: Int, bodyLimit: Int }
+
+/** @Transport.Exchange.Head — a response's version, status, and headers */
+export type Head = { version: Str, status: Http.Status, headers: Array[(Str, Str)] }
+
+/** @Transport.Exchange.Exchanged — a complete response and whether its connection may be reused */
+export type Exchanged = { head: Head, body: Bytes, trailers: Array[(Str, Str)], reusable: Bool }
+
+/** @Transport.Exchange.Trouble — why an exchange failed, and whether any of the response had arrived */
+export type Trouble = { fault: Wire.Fault, answered: Bool }
+
+/** @Transport.Exchange.Stream — bytes read but not yet consumed, and whether any arrived at all */
+type Stream = { pending: Bytes, answered: Bool }
+
+/// The blank line that ends a head.
+const HEAD_END: Str = "\r\n\r\n"
+
+/// Writes the request, streaming the producer's body in chunks when there is one, and reads its final
+/// response, skipping interim `1xx` responses; the body is buffered, or handed to the receiver as it
+/// arrives unless it belongs to a redirect being followed.
+export fn exchange(
+  link: &Wire.Link,
+  written: &Bytes,
+  method: &Http.Method,
+  requestHeaders: &Array[(Str, Str)],
+  reading: &Reading,
+  deadline: Option[Int],
+  receiver: Option[Request.Receiver],
+  following: Bool,
+  upload: Option[Content.Producer]
+) -> Result[Exchanged, Trouble] {
+  if let Err(fault) = Wire.write(link, written, deadline) { return Err(Trouble{fault: fault, answered: false}) }
+  if let Some(producer) = upload {
+    if let Err(fault) = streamBody(link, producer, deadline) { return Err(Trouble{fault: fault, answered: false}) }
+  }
+  var stream = Stream{pending: ByteSeq.empty(), answered: false}
+  loop {
+    let (head, headBytes, rest) = readHead(link, &stream, reading, deadline) ?
+    stream = rest
+    if head.status.code >= 200 || head.status.code == 101 {
+      let framing = match Message.framingOf(&headBytes, method) {
+        case Some(found) => found
+        case None => { return Err(broken(HttpClient.Protocol(Template.fill(Messages.BAD_HEAD, &["no framing"])), true)) }
+      }
+      let taking = if following && Redirect.isRedirect(head.status.code) { None } else { receiver }
+      let (body, trailers, complete) = readBody(link, &stream, &framing, reading, deadline, taking) ?
+      let reusable = complete && Persistence.keepsAlive(head.version, requestHeaders, &head.headers, &framing) && head.status.code != 101
+      return Ok(Exchanged{head: head, body: body, trailers: trailers, reusable: reusable})
+    }
+  }
+}
+
+/// Writes every piece the producer gives as a chunk, then the terminating chunk.
+fn streamBody(link: &Wire.Link, producer: Content.Producer, deadline: Option[Int]) -> Result[(), Wire.Fault] {
+  loop {
+    match producer() {
+      case Some(piece) => {
+        if !piece.isEmpty() {
+          Wire.write(link, &(hexOf(piece.length()) + "\r\n").toBytes().concat(piece).concat("\r\n".toBytes()), deadline) ?
+        }
+      }
+      case None => { return Wire.write(link, &"0\r\n\r\n".toBytes(), deadline) }
+    }
+  }
+}
+
+/// A count written in hexadecimal.
+fn hexOf(count: Int) -> Str {
+  if count == 0 { return "0" }
+  var out = ""
+  var left = count
+  while left > 0 {
+    let digit = left % 16
+    out = "0123456789abcdef".slice(digit, digit + 1) + out
+    left = left / 16
+  }
+  out
+}
+
+/// A trouble carrying a failure.
+fn broken(failure: HttpClient.Failure, answered: Bool) -> Trouble { Trouble{fault: Wire.Broken(failure), answered: answered} }
+
+/// Reads until the next head is complete, and answers it, its bytes, and what followed it.
+fn readHead(link: &Wire.Link, stream: &Stream, reading: &Reading, deadline: Option[Int]) -> Result[(Head, Bytes, Stream), Trouble] {
+  var pending = stream.pending
+  var answered = stream.answered
+  loop {
+    let end = pending.indexOf(HEAD_END.toBytes())
+    if end + 4 > reading.headersLimit || (end < 0 && pending.length() > reading.headersLimit) { return Err(broken(HttpClient.HeadersTooLarge(reading.headersLimit), true)) }
+    if end >= 0 {
+      let headBytes = pending.take(end + 4)
+      let head = parseHead(&headBytes) ?
+      return Ok((head, headBytes, Stream{pending: pending.drop(end + 4), answered: true}))
+    }
+    match Wire.read(link, deadline) {
+      case Ok(Some(piece)) => {
+        pending = pending.concat(piece)
+        answered = true
+      }
+      case Ok(None) => { return Err(Trouble{fault: Wire.Ended, answered: answered}) }
+      case Err(fault) => { return Err(Trouble{fault: fault, answered: answered}) }
+    }
+  }
+}
+
+/// The version, status, and headers a head states.
+fn parseHead(headBytes: &Bytes) -> Result[Head, Trouble] {
+  let text = match ByteSeq.toText(headBytes) {
+    case Ok(found) => found
+    case Err(_) => { return Err(broken(HttpClient.Protocol(Template.fill(Messages.BAD_HEAD, &["not text"])), true)) }
+  }
+  let firstLine = text.split("\r\n")[0]
+  let version = firstLine.split(" ")[0]
+  if !version.startsWith("HTTP/1.") { return Err(broken(HttpClient.Protocol(Template.fill(Messages.BAD_STATUS_LINE, &[firstLine])), true)) }
+  match Message.parseResponse(text) {
+    case Ok(parsed) => Ok(Head{version: version, status: parsed.status, headers: parsed.headers})
+    case Err(problem) => Err(broken(HttpClient.Protocol(Template.fill(Messages.BAD_HEAD, &[Message.explain(&problem)])), true))
+  }
+}
+
+/// Reads the body the framing describes; answers it (empty when a receiver took it), its trailers,
+/// and whether it was read to its end with nothing left over.
+fn readBody(
+  link: &Wire.Link,
+  stream: &Stream,
+  framing: &Message.Framing,
+  reading: &Reading,
+  deadline: Option[Int],
+  receiver: Option[Request.Receiver]
+) -> Result[(Bytes, Array[(Str, Str)], Bool), Trouble] {
+  match framing {
+    case Message.HeadOnly => Ok((ByteSeq.empty(), [], stream.pending.isEmpty()))
+    case Message.Length(size) => {
+      if receiver == None && size > reading.bodyLimit { return Err(broken(HttpClient.ContentTooLarge(reading.bodyLimit), true)) }
+      readLength(link, stream, size, deadline, receiver)
+    }
+    case Message.Chunked => readChunked(link, stream, reading, deadline, receiver)
+    case Message.UntilClose => readToClose(link, stream, reading, deadline, receiver)
+  }
+}
+
+/// Reads a body of a stated length.
+fn readLength(link: &Wire.Link, stream: &Stream, size: Int, deadline: Option[Int], receiver: Option[Request.Receiver]) -> Result[(Bytes, Array[(Str, Str)], Bool), Trouble] {
+  var collected: Array[Bytes] = []
+  var left = size
+  var piece = stream.pending
+  loop {
+    let taken = piece.take(left)
+    left = left - taken.length()
+    if !taken.isEmpty() {
+      match receiver {
+        case Some(take) => if !take(taken) { return Ok((ByteSeq.empty(), [], false)) }
+        case None => { collected = collected.push(taken) }
+      }
+    }
+    if left == 0 { return Ok((ByteSeq.join(&collected), [], piece.length() == taken.length())) }
+    match Wire.read(link, deadline) {
+      case Ok(Some(next)) => { piece = next }
+      case Ok(None) => { return Err(Trouble{fault: Wire.Broken(HttpClient.ResponseEnded), answered: true}) }
+      case Err(fault) => { return Err(Trouble{fault: fault, answered: true}) }
+    }
+  }
+}
+
+/// Reads a chunked body and its trailers.
+fn readChunked(link: &Wire.Link, stream: &Stream, reading: &Reading, deadline: Option[Int], receiver: Option[Request.Receiver]) -> Result[(Bytes, Array[(Str, Str)], Bool), Trouble] {
+  let limit = if receiver == None { reading.bodyLimit } else { Defaults.UNLIMITED }
+  var decoder = Chunked.decoder()
+  var collected: Array[Bytes] = []
+  var piece = stream.pending
+  loop {
+    match Chunked.feed(&decoder, &piece, limit) {
+      case Err(Chunked.Exceeded) => { return Err(broken(HttpClient.ContentTooLarge(reading.bodyLimit), true)) }
+      case Err(Chunked.Malformed(reason)) => { return Err(broken(HttpClient.Protocol(Template.fill(Messages.BAD_CHUNK, &[reason])), true)) }
+      case Ok((next, decoded)) => {
+        decoder = next
+        if !decoded.isEmpty() {
+          match receiver {
+            case Some(take) => if !take(decoded) { return Ok((ByteSeq.empty(), [], false)) }
+            case None => { collected = collected.push(decoded) }
+          }
+        }
+      }
+    }
+    if Chunked.isDone(&decoder) { return Ok((ByteSeq.join(&collected), decoder.trailers, Chunked.leftover(&decoder).isEmpty())) }
+    match Wire.read(link, deadline) {
+      case Ok(Some(next)) => { piece = next }
+      case Ok(None) => { return Err(Trouble{fault: Wire.Broken(HttpClient.ResponseEnded), answered: true}) }
+      case Err(fault) => { return Err(Trouble{fault: fault, answered: true}) }
+    }
+  }
+}
+
+/// Reads a body that ends when the connection closes.
+fn readToClose(link: &Wire.Link, stream: &Stream, reading: &Reading, deadline: Option[Int], receiver: Option[Request.Receiver]) -> Result[(Bytes, Array[(Str, Str)], Bool), Trouble] {
+  var collected: Array[Bytes] = []
+  var size = 0
+  var piece = stream.pending
+  loop {
+    if !piece.isEmpty() {
+      match receiver {
+        case Some(take) => if !take(piece) { return Ok((ByteSeq.empty(), [], false)) }
+        case None => {
+          size = size + piece.length()
+          if size > reading.bodyLimit { return Err(broken(HttpClient.ContentTooLarge(reading.bodyLimit), true)) }
+          collected = collected.push(piece)
+        }
+      }
+    }
+    match Wire.read(link, deadline) {
+      case Ok(Some(next)) => { piece = next }
+      case Ok(None) => { return Ok((ByteSeq.join(&collected), [], false)) }
+      case Err(Wire.Ended) => { return Ok((ByteSeq.join(&collected), [], false)) }
+      case Err(fault) => { return Err(Trouble{fault: fault, answered: true}) }
+    }
+  }
+}

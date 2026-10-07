@@ -1,0 +1,188 @@
+/** @Factory.Builder.Module — how one named client and its handler pipeline are configured */
+module PuduLangHttpClient.Factory.Builder
+
+import Std.Http as Http
+import Std.Option as Option
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Domain.Version as Version
+import PuduLangHttpClient.Handler as Handler
+import PuduLangHttpClient.Transport as Transport
+
+/** @Factory.Builder.Primary — the innermost handler: a pooled transport, or one of the program's own */
+export type Primary = Pooled(Transport.Options) | Custom(fn() -> Handler.Send)
+
+/** @Factory.Builder.Observation — what an observer is told about the client it watches */
+export type Observation = { name: Str, redact: fn(Str) -> Bool }
+
+/** @Factory.Builder.Observer — a pair of handlers placed around and inside every other handler */
+export type Observer = { outer: fn(Observation) -> Handler.Handler, inner: fn(Observation) -> Handler.Handler }
+
+/** @Factory.Builder.Builder — the configuration of one name, or of every client */
+export type Builder = {
+  name: Str,
+  everyClient: Bool,
+  clientActions: Array[fn(Client.Client) -> Client.Client],
+  handlers: Array[fn() -> Handler.Handler],
+  handlerEdits: Array[fn(Array[Handler.Handler]) -> Array[Handler.Handler]],
+  primary: Option[Primary],
+  transportEdits: Array[fn(Transport.Options) -> Transport.Options],
+  lifetime: Option[Int],
+  observers: Array[Observer],
+  observersCleared: Bool,
+  redacted: Array[Str],
+  redactWhen: Option[fn(Str) -> Bool]
+}
+
+/// The headers whose values observers never see unless the program says otherwise.
+const SENSITIVE: Array[Str] = ["authorization", "proxy-authorization", "cookie", "set-cookie"]
+
+/// The configuration of the client with the given name.
+export fn named(name: Str) -> Builder {
+  Builder {
+    name: name,
+    everyClient: false,
+    clientActions: [],
+    handlers: [],
+    handlerEdits: [],
+    primary: None,
+    transportEdits: [],
+    lifetime: None,
+    observers: [],
+    observersCleared: false,
+    redacted: [],
+    redactWhen: None
+  }
+}
+
+/// The configuration applied to every client before its own.
+export fn defaults() -> Builder { Builder{..named(Defaults.DEFAULT_NAME), everyClient: true} }
+
+/// One name's configuration followed by another's: settings that add are joined in order, and
+/// settings that replace are taken from the later one when it has them.
+export fn combine(first: &Builder, second: &Builder) -> Builder {
+  Builder {
+    name: second.name,
+    everyClient: first.everyClient && second.everyClient,
+    clientActions: first.clientActions.concat(second.clientActions),
+    handlers: first.handlers.concat(second.handlers),
+    handlerEdits: first.handlerEdits.concat(second.handlerEdits),
+    primary: if Option.isSome(&second.primary) { second.primary } else { first.primary },
+    transportEdits: first.transportEdits.concat(second.transportEdits),
+    lifetime: if Option.isSome(&second.lifetime) { second.lifetime } else { first.lifetime },
+    observers: if second.observersCleared { second.observers } else { first.observers.concat(second.observers) },
+    observersCleared: first.observersCleared || second.observersCleared,
+    redacted: first.redacted.concat(second.redacted),
+    redactWhen: if Option.isSome(&second.redactWhen) { second.redactWhen } else { first.redactWhen }
+  }
+}
+
+/// How long the builder's handler pipeline is reused before the next one is built.
+export fn lifetimeOf(builder: &Builder) -> Int { Option.unwrapOr(builder.lifetime, Defaults.HANDLER_LIFETIME) }
+
+/// Whether observers see a header's value: never for the sensitive headers and the named ones, and
+/// never when the predicate holds.
+export fn redaction(builder: &Builder) -> fn(Str) -> Bool {
+  let names = SENSITIVE.concat(builder.redacted).map(|name: Str| name.toLower())
+  let predicate = builder.redactWhen
+  fn(header: Str) -> Bool {
+    let lower = header.toLower()
+    names.contains(lower) || (match predicate {
+        case Some(test) => test(lower)
+        case None => false
+      })
+  }
+}
+
+/** @Factory.Builder.Configuring — a named client configured one decision at a time */
+export trait Configuring {
+  /// Resolves relative addresses against a base address.
+  fn withBaseAddress(self: &Self, address: Str) -> Self
+  /// Adds a header to every request that does not carry it.
+  fn withDefaultHeader(self: &Self, name: Str, value: Str) -> Self
+  /// Gives each request this many milliseconds, or `Defaults.INFINITE`.
+  fn withTimeout(self: &Self, millis: Int) -> Self
+  /// Buffers at most this many response body bytes.
+  fn withMaxResponseContentBufferSize(self: &Self, bytes: Int) -> Self
+  /// Sends the requests the client's helpers build with this version and policy.
+  fn withDefaultVersion(self: &Self, version: Http.Version, policy: Version.Policy) -> Self
+  /// Changes the client in any other way, after the settings before it.
+  fn configureClient(self: &Self, action: fn(Client.Client) -> Client.Client) -> Self
+  /// Adds a handler inside the ones added before it.
+  fn withHandler(self: &Self, handler: Handler.Handler) -> Self
+  /// Adds a handler made afresh for every handler pipeline the factory builds.
+  fn withHandlerFactory(self: &Self, make: fn() -> Handler.Handler) -> Self
+  /// Rearranges the handlers, once every one has been added.
+  fn configureHandlers(self: &Self, edit: fn(Array[Handler.Handler]) -> Array[Handler.Handler]) -> Self
+  /// Uses a pooled transport with these options as the primary handler.
+  fn withTransport(self: &Self, options: Transport.Options) -> Self
+  /// Changes the options of the pooled transport, after the settings before it.
+  fn configureTransport(self: &Self, edit: fn(Transport.Options) -> Transport.Options) -> Self
+  /// Uses a primary handler of the program's own, made afresh for every handler pipeline.
+  fn withPrimary(self: &Self, make: fn() -> Handler.Send) -> Self
+  /// Reuses each handler pipeline for this many milliseconds, or `Defaults.INFINITE`.
+  fn withHandlerLifetime(self: &Self, millis: Int) -> Self
+  /// Adds an observer around and inside the handlers.
+  fn observedBy(self: &Self, observer: Observer) -> Self
+  /// Removes every observer added before, including the defaults'.
+  fn withoutObservers(self: &Self) -> Self
+  /// Hides the values of the named headers from observers.
+  fn redactingHeaders(self: &Self, names: &Array[Str]) -> Self
+  /// Hides the value of every header the predicate holds for from observers.
+  fn redactingWhen(self: &Self, test: fn(Str) -> Bool) -> Self
+}
+
+impl Configuring for Builder {
+  /// Resolves relative addresses against a base address.
+  fn withBaseAddress(self: &Self, address: Str) -> Self { self.configureClient(|client: Client.Client| client.withBaseAddress(address)) }
+
+  /// Adds a header to every request that does not carry it.
+  fn withDefaultHeader(self: &Self, name: Str, value: Str) -> Self { self.configureClient(|client: Client.Client| client.withDefaultHeader(name, value)) }
+
+  /// Gives each request this many milliseconds, or `Defaults.INFINITE`.
+  fn withTimeout(self: &Self, millis: Int) -> Self { self.configureClient(|client: Client.Client| client.withTimeout(millis)) }
+
+  /// Buffers at most this many response body bytes.
+  fn withMaxResponseContentBufferSize(self: &Self, bytes: Int) -> Self { self.configureClient(|client: Client.Client| client.withMaxResponseContentBufferSize(bytes)) }
+
+  /// Sends the requests the client's helpers build with this version and policy.
+  fn withDefaultVersion(self: &Self, version: Http.Version, policy: Version.Policy) -> Self {
+    self.configureClient(|client: Client.Client| client.withDefaultVersion(version, policy))
+  }
+
+  /// Changes the client in any other way, after the settings before it.
+  fn configureClient(self: &Self, action: fn(Client.Client) -> Client.Client) -> Self { Builder{..*self, clientActions: self.clientActions.push(action)} }
+
+  /// Adds a handler inside the ones added before it.
+  fn withHandler(self: &Self, handler: Handler.Handler) -> Self { self.withHandlerFactory(|| handler) }
+
+  /// Adds a handler made afresh for every handler pipeline the factory builds.
+  fn withHandlerFactory(self: &Self, make: fn() -> Handler.Handler) -> Self { Builder{..*self, handlers: self.handlers.push(make)} }
+
+  /// Rearranges the handlers, once every one has been added.
+  fn configureHandlers(self: &Self, edit: fn(Array[Handler.Handler]) -> Array[Handler.Handler]) -> Self { Builder{..*self, handlerEdits: self.handlerEdits.push(edit)} }
+
+  /// Uses a pooled transport with these options as the primary handler.
+  fn withTransport(self: &Self, options: Transport.Options) -> Self { Builder{..*self, primary: Some(Pooled(options))} }
+
+  /// Changes the options of the pooled transport, after the settings before it.
+  fn configureTransport(self: &Self, edit: fn(Transport.Options) -> Transport.Options) -> Self { Builder{..*self, transportEdits: self.transportEdits.push(edit)} }
+
+  /// Uses a primary handler of the program's own, made afresh for every handler pipeline.
+  fn withPrimary(self: &Self, make: fn() -> Handler.Send) -> Self { Builder{..*self, primary: Some(Custom(make))} }
+
+  /// Reuses each handler pipeline for this many milliseconds, or `Defaults.INFINITE`.
+  fn withHandlerLifetime(self: &Self, millis: Int) -> Self { Builder{..*self, lifetime: Some(millis)} }
+
+  /// Adds an observer around and inside the handlers.
+  fn observedBy(self: &Self, observer: Observer) -> Self { Builder{..*self, observers: self.observers.push(observer)} }
+
+  /// Removes every observer added before, including the defaults'.
+  fn withoutObservers(self: &Self) -> Self { Builder{..*self, observers: [], observersCleared: true} }
+
+  /// Hides the values of the named headers from observers.
+  fn redactingHeaders(self: &Self, names: &Array[Str]) -> Self { Builder{..*self, redacted: self.redacted.concat(*names)} }
+
+  /// Hides the value of every header the predicate holds for from observers.
+  fn redactingWhen(self: &Self, test: fn(Str) -> Bool) -> Self { Builder{..*self, redactWhen: Some(test)} }
+}

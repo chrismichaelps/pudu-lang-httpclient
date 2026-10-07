@@ -1,0 +1,21 @@
+/** @Test.Domain.RetryAfter.Suite — how long a server asked the client to wait */
+module PuduLangHttpClient.Domain.RetryAfterTest
+
+import Std.Io as Io
+import Std.Test as Test
+import PuduLangHttpClient.Domain.RetryAfter as RetryAfter
+
+/// Runs the suite.
+fn main() -> Int {
+  let checks = Test.suite("Domain.RetryAfter", &[
+      Test.equals("seconds become milliseconds", &[RetryAfter.delay("120", 0), RetryAfter.delay(" 0 ", 0)], &[Some(120000), Some(0)]),
+      Test.equals("negative seconds or other text ask for nothing", &[RetryAfter.delay("-1", 0), RetryAfter.delay("soon", 0)], &[None, None]),
+      Test.equals("a date asks for the time until it", &RetryAfter.delay("Thu, 01 Jan 1970 00:00:10 GMT", 4000), &Some(6000)),
+      Test.equals("a date in the past asks for no wait", &(RetryAfter.delay("Thu, 01 Jan 1970 00:00:10 GMT", 10000), RetryAfter.delay("Thu, 01 Jan 1970 00:00:10 GMT", 20000)), &(Some(0), Some(0)))
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

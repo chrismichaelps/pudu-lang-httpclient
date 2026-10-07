@@ -1,0 +1,50 @@
+/** @Transport.Writer.Module — a request written as the bytes that go on the wire */
+module PuduLangHttpClient.Transport.Writer
+
+import Std.Bytes as ByteSeq
+import Std.Http as Http
+import PuduLangHttpClient.Domain.Headers as Headers
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient.Request as Request
+
+/** @Transport.Writer.Form — how the request line names its target */
+export type Form = OriginForm | AbsoluteForm
+
+/// The line break the protocol ends every line with.
+const CRLF: Str = "\r\n"
+
+/// The head and body of a request to an endpoint: the request line in the given form, `host` unless
+/// the request names one, the request's headers, the body's headers, the body's length or chunked
+/// framing for a streamed body, and any extra headers the route adds.
+export fn render(request: &Request.Request, version: &Http.Version, endpoint: &Uri.Endpoint, form: &Form, extra: &Array[(Str, Str)]) -> Bytes {
+  let target = match form {
+    case OriginForm => Uri.target(request.uri)
+    case AbsoluteForm => Uri.withoutFragment(request.uri)
+  }
+  var head = Http.methodName(&request.method) + " " + target + " " + Http.versionName(version) + CRLF
+  if !Headers.has(&request.headers, "host") { head = head + "host: " + Uri.authority(endpoint) + CRLF }
+  for pair in request.headers {
+    if pair[0].toLower() != "content-length" { head = head + pair[0] + ": " + pair[1] + CRLF }
+  }
+  let body = match request.content {
+    case Some(content) => {
+      for pair in content.headers {
+        if pair[0].toLower() != "content-length" { head = head + pair[0] + ": " + pair[1] + CRLF }
+      }
+      content.payload
+    }
+    case None => ByteSeq.empty()
+  }
+  let framed = Headers.has(&request.headers, "transfer-encoding")
+  let streamed = match request.content {
+    case Some(content) => content.stream != None
+    case None => false
+  }
+  if streamed && !framed {
+    head = head + "transfer-encoding: chunked" + CRLF
+  } else if !framed && (!body.isEmpty() || request.content != None || Http.expectsBody(&request.method)) {
+    head = head + "content-length: " + show(body.length()) + CRLF
+  }
+  for pair in *extra { head = head + pair[0] + ": " + pair[1] + CRLF }
+  (head + CRLF).toBytes().concat(body)
+}

@@ -1,0 +1,52 @@
+/** @Test.Client.Json.Suite — requests and responses whose bodies are JSON */
+module PuduLangHttpClient.Client.JsonTest
+
+import Std.Http as Http
+import Std.Io as Io
+import Std.Json as Json
+import Std.Result as Result
+import Std.Test as Test
+import PuduLangHttpClient.Client as Client
+import PuduLangHttpClient.Client.Json as JsonClient
+import PuduLangHttpClient.Content as Content
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Request as Request
+import PuduLangHttpClient.Response as Response
+import PuduLangHttpClient.Stub as Stub
+
+/** @Test.Client.Json.Todo — one item, written and read through derived implementations */
+type Todo = { id: Int, title: Str, done: Bool } derives Json.Encode, Json.Decode
+
+/// A response echoing the request's method, accept header, and body as JSON.
+fn echo(request: Request.Request) -> HttpClient.Outcome[Response.Response] {
+  let body = match request.content {
+    case Some(found) => Result.unwrapOr(Content.readText(&found), "")
+    case None => "\{\"id\":1,\"title\":\"" + Http.methodName(&request.method) + " " + match Request.header(&request, "accept") { case Some(found) => found case None => "" } + "\",\"done\":false\}"
+  }
+  Ok(Response.answer(&request, 200).withContent(Content.text(body, "application/json")))
+}
+
+/// Runs the suite.
+fn main() -> Int {
+  let stub = Stub.create()
+  Stub.when(&stub, |request: Request.Request| request.uri.endsWith("/todos/1"), echo)
+  Stub.respond(&stub, Http.Get, "/broken", 200, "not json")
+  let client = Client.create(Stub.send(&stub)).withBaseAddress("http://api.test/")
+  let todo = Todo{id: 2, title: "write docs", done: true}
+  let checks = Test.suite("Client.Json", &[
+      Test.equals("a get reads a derived value and asks for JSON", &JsonClient.getFromJson[Todo](&client, "todos/1"), &Ok(Todo{id: 1, title: "GET application/json", done: false})),
+      Test.equals("a get reads a document", &Result.map(JsonClient.getJson(&client, "todos/1"), |value: Json.Json| Json.field(&value, "id")), &Ok(Some(Json.Number(1)))),
+      Test.equals("a delete reads a derived value", &JsonClient.deleteFromJson[Todo](&client, "todos/1"), &Ok(Todo{id: 1, title: "DELETE application/json", done: false})),
+      Test.equals("a post, put, and patch write a derived value", &[JsonClient.postAsJson(&client, "todos/1", &todo), JsonClient.putAsJson(&client, "todos/1", &todo), JsonClient.patchAsJson(&client, "todos/1", &todo)].map(|outcome: HttpClient.Outcome[Response.Response]| Result.andThen(outcome, |r: Response.Response| Response.readAs[Todo](&r))), &[Ok(todo), Ok(todo), Ok(todo)]),
+      Test.equals("a missing resource is unsuccessful", &JsonClient.getFromJson[Todo](&client, "todos/2"), &Err(HttpClient.Unsuccessful(404, "Not Found"))),
+      Test.that("a body that is not JSON is unreadable", match JsonClient.getJson(&client, "broken") {
+          case Err(HttpClient.Unreadable(_)) => true
+          case _ => false
+        })
+    ])
+  let ran = Test.run(&checks)
+  for failure in Test.failuresOf(&ran) {
+    let _reported = Io.writeErrorLine(failure)
+  }
+  Test.report(&ran)
+}

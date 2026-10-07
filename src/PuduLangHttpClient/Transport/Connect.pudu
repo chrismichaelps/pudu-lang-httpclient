@@ -1,0 +1,115 @@
+/** @Transport.Connect.Module — connections opened directly or through a proxy */
+module PuduLangHttpClient.Transport.Connect
+
+import Std.Bytes as ByteSeq
+import Std.Http.Message as Message
+import PuduLangHttpClient.Constants.Defaults as Defaults
+import PuduLangHttpClient.Constants.Messages as Messages
+import PuduLangHttpClient.Domain.Expiry as Expiry
+import PuduLangHttpClient.Domain.Uri as Uri
+import PuduLangHttpClient as HttpClient
+import PuduLangHttpClient.Proxy as Proxy
+import PuduLangHttpClient.Transport.Wire as Wire
+import PuduLangHttpClient.Utils.Template as Template
+
+/** @Transport.Connect.Route — where a request's connection goes and how it is shared */
+export type Route = { key: Str, target: Uri.Endpoint, via: Option[Proxy.Proxy] }
+
+/// The route to an endpoint: directly, or through the proxy unless it bypasses the host.
+export fn routeTo(target: &Uri.Endpoint, proxy: &Option[Proxy.Proxy]) -> Route {
+  match proxy {
+    case Some(found) => {
+      if Proxy.bypasses(&found, target.host) {
+        Route{key: "direct " + Uri.origin(target), target: *target, via: None}
+      } else if target.secure {
+        Route{key: "tunnel " + found.address + " " + Uri.origin(target), target: *target, via: Some(found)}
+      } else {
+        Route{key: "proxy " + found.address, target: *target, via: Some(found)}
+      }
+    }
+    case None => Route{key: "direct " + Uri.origin(target), target: *target, via: None}
+  }
+}
+
+/// Whether requests on the route name their target in absolute form, as a plain proxy needs.
+export fn isProxied(route: &Route) -> Bool {
+  match route.via {
+    case Some(_) => !route.target.secure
+    case None => false
+  }
+}
+
+/// A new connection along the route, opened within `connectTimeout` milliseconds as well as the
+/// request's deadline; a secured target is verified against its own host name.
+export fn open(route: &Route, connectTimeout: Int, deadline: Option[Int]) -> Result[Wire.Link, Wire.Fault] {
+  let connecting = if connectTimeout == Defaults.INFINITE { deadline } else { Expiry.earliest(deadline, Some(clock() + connectTimeout)) }
+  let outcome = match route.via {
+    case None => dialSecured(&route.target, connecting)
+    case Some(proxy) => through(&proxy, &route.target, connecting)
+  }
+  match outcome {
+    case Err(Wire.Stalled) => {
+      if Wire.budget(deadline) == None { Err(Wire.Stalled) } else { Err(Wire.Broken(HttpClient.Connection(Template.fill(Messages.STALLED, &["connecting"])))) }
+    }
+    case other => other
+  }
+}
+
+/// A connection to the endpoint, secured when the endpoint is.
+fn dialSecured(target: &Uri.Endpoint, deadline: Option[Int]) -> Result[Wire.Link, Wire.Fault] {
+  let link = Wire.dial(target.host, target.port, deadline) ?
+  if target.secure { Wire.secure(link, target.host, deadline) } else { Ok(link) }
+}
+
+/// A connection through the proxy: to the proxy itself for a plain target, or a tunnel the proxy
+/// opens to a secured target, secured end to end.
+fn through(proxy: &Proxy.Proxy, target: &Uri.Endpoint, deadline: Option[Int]) -> Result[Wire.Link, Wire.Fault] {
+  let place = match Uri.endpointOf(proxy.address) {
+    case Some(found) => found
+    case None => { return Err(Wire.Broken(HttpClient.ProxyTunnel(proxy.address))) }
+  }
+  let link = Wire.dial(place.host, place.port, deadline) ?
+  if !target.secure { return Ok(link) }
+  let authority = target.host + ":" + show(target.port)
+  var head = "CONNECT " + authority + " HTTP/1.1\r\nhost: " + authority + "\r\n"
+  if let Some(credentials) = Proxy.authorization(proxy) { head = head + "proxy-authorization: " + credentials + "\r\n" }
+  if let Err(fault) = Wire.write(&link, &(head + "\r\n").toBytes(), deadline) {
+    Wire.close(&link)
+    return Err(fault)
+  }
+  match tunnelAnswer(&link, deadline) {
+    case Ok(code) => {
+      if code >= 200 && code < 300 { Wire.secure(link, target.host, deadline) } else {
+        Wire.close(&link)
+        Err(Wire.Broken(HttpClient.ProxyTunnel("status " + show(code))))
+      }
+    }
+    case Err(fault) => {
+      Wire.close(&link)
+      Err(fault)
+    }
+  }
+}
+
+/// The status a proxy answered a tunnel request with.
+fn tunnelAnswer(link: &Wire.Link, deadline: Option[Int]) -> Result[Int, Wire.Fault] {
+  var pending = ByteSeq.empty()
+  loop {
+    let end = pending.indexOf("\r\n\r\n".toBytes())
+    if end >= 0 {
+      let text = match ByteSeq.toText(&pending.take(end + 4)) {
+        case Ok(found) => found
+        case Err(_) => { return Err(Wire.Broken(HttpClient.ProxyTunnel("the answer is not text"))) }
+      }
+      return match Message.parseResponse(text) {
+        case Ok(parsed) => Ok(parsed.status.code)
+        case Err(problem) => Err(Wire.Broken(HttpClient.ProxyTunnel(Message.explain(&problem))))
+      }
+    }
+    if pending.length() > Defaults.MAX_RESPONSE_HEADERS { return Err(Wire.Broken(HttpClient.ProxyTunnel("the answer is too long"))) }
+    match Wire.read(link, deadline) ? {
+      case Some(piece) => { pending = pending.concat(piece) }
+      case None => { return Err(Wire.Broken(HttpClient.ProxyTunnel("the proxy closed the connection"))) }
+    }
+  }
+}
